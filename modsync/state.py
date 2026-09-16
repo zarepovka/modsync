@@ -31,7 +31,11 @@ def validate_state(value: object, source: str = "installation state") -> dict[st
 
 def load_state(install_directory: Path) -> dict[str, Any]:
     """Load state, returning an empty state if ModSync has not run yet."""
-    path = install_directory / STATE_FILENAME
+    return load_state_file(install_directory / STATE_FILENAME)
+
+
+def load_state_file(path: Path) -> dict[str, Any]:
+    """Load state from an explicit path, returning an empty initial state if absent."""
     if not path.exists():
         return empty_state()
     try:
@@ -67,7 +71,11 @@ def atomic_write_json(path: Path, value: object) -> None:
 
 def save_state(install_directory: Path, state: dict[str, Any]) -> None:
     """Atomically save state in the installation directory."""
-    path = install_directory / STATE_FILENAME
+    save_state_file(install_directory / STATE_FILENAME, state)
+
+
+def save_state_file(path: Path, state: dict[str, Any]) -> None:
+    """Atomically save state to an explicit path."""
     try:
         validate_state(state)
         atomic_write_json(path, state)

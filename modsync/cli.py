@@ -5,14 +5,17 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Callable, Sequence
+from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__
 from .backup import BackupManager
 from .config import load_modpack
-from .exceptions import ModSyncError
+from .exceptions import ModSyncError, ProfileError
 from .installer import Installer
-from .models import Mod, Modpack
+from .models import Mod, Modpack, Profile
+from .profiles import ProfileStore
 from .verifier import verify_modpack
 
 
@@ -30,16 +33,40 @@ def build_parser() -> argparse.ArgumentParser:
         ("info", "Show modpack information"),
     ):
         command = subparsers.add_parser(name, help=help_text)
-        command.add_argument("modpack", type=Path, help="Path to modpack.json")
+        command.add_argument("modpack", nargs="?", type=Path, help="Path to modpack.json")
+        command.add_argument("--profile", help="Use a stored profile instead of modpack.json")
 
     backup = subparsers.add_parser("backup", help="List or restore installation backups")
     backup_commands = backup.add_subparsers(dest="backup_command", required=True)
     backup_list = backup_commands.add_parser("list", help="List available backups")
-    backup_list.add_argument("modpack", type=Path, help="Path to modpack.json")
+    backup_list.add_argument("modpack", nargs="?", type=Path, help="Path to modpack.json")
+    backup_list.add_argument("--profile", help="Use a stored profile")
     backup_restore = backup_commands.add_parser("restore", help="Restore a verified backup")
-    backup_restore.add_argument("modpack", type=Path, help="Path to modpack.json")
-    backup_restore.add_argument("backup_id", help="Backup ID returned by backup list")
+    backup_restore.add_argument(
+        "target", nargs="+", help="Legacy: modpack.json backup-id; profile mode: backup-id"
+    )
+    backup_restore.add_argument("--profile", help="Use a stored profile")
+
+    profile = subparsers.add_parser("profile", help="Create and manage stored profiles")
+    profile_commands = profile.add_subparsers(dest="profile_command", required=True)
+    profile_commands.add_parser("list", help="List profiles")
+    profile_create = profile_commands.add_parser("create", help="Create a profile")
+    profile_create.add_argument("name")
+    profile_create.add_argument("modpack", type=Path)
+    profile_info = profile_commands.add_parser("info", help="Show profile information")
+    profile_info.add_argument("name")
+    profile_activate = profile_commands.add_parser("activate", help="Set the active profile")
+    profile_activate.add_argument("name")
+    profile_delete = profile_commands.add_parser("delete", help="Delete ModSync profile data")
+    profile_delete.add_argument("name")
+    profile_delete.add_argument("--yes", action="store_true", help="Skip confirmation")
     return parser
+
+
+@dataclass(frozen=True, slots=True)
+class _Target:
+    modpack: Modpack
+    profile_name: str | None = None
 
 
 def _progress(mod: Mod) -> Callable[[int, int | None], None]:
@@ -72,7 +99,6 @@ def _run_install(modpack: Modpack, *, updating: bool) -> int:
         _progress(mod)(downloaded, total)
 
     installer = Installer()
-    # Keep output readable while still exposing byte-level progress from Downloader.
     if updating:
         report = installer.update_modpack(modpack, progress)
     else:
@@ -150,26 +176,128 @@ def _run_backup_restore(modpack: Modpack, backup_id: str) -> int:
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _resolve_target(
+    store: ProfileStore, modpack_path: Path | None, profile_name: str | None
+) -> _Target:
+    if modpack_path is not None and profile_name is not None:
+        raise ProfileError("Use either modpack.json or --profile, not both")
+    if modpack_path is not None:
+        return _Target(load_modpack(modpack_path))
+    selected = profile_name or store.active_name()
+    if selected is None:
+        raise ProfileError(
+            "No active profile. Use --profile NAME, activate a profile, or provide modpack.json"
+        )
+    profile = store.get(selected)
+    return _Target(store.load_modpack(profile.name), profile.name)
+
+
+def _print_profile(profile: Profile, *, active: bool) -> None:
+    print(f"Profile: {profile.name}{' (active)' if active else ''}")
+    print(f"Game: {profile.game}")
+    print(f"Mods: {profile.mod_count}")
+    print(f"Install directory: {profile.install_directory}")
+    print(f"Created: {profile.created_at}")
+    print(f"Updated: {profile.updated_at}")
+    print(f"Modpack source: {profile.modpack_source}")
+
+
+def _run_profile_command(args: argparse.Namespace, store: ProfileStore) -> int:
+    if args.profile_command == "list":
+        profiles = store.list()
+        active = store.active_name()
+        if not profiles:
+            print("No profiles found.")
+            return 0
+        print("NAME | GAME | MODS | ACTIVE")
+        for profile in profiles:
+            marker = "yes" if profile.name == active else ""
+            print(f"{profile.name} | {profile.game} | {profile.mod_count} | {marker}")
+        return 0
+    if args.profile_command == "create":
+        profile = store.create(args.name, args.modpack)
+        print(f"Profile created: {profile.name}")
+        print(f"Activate it: modsync profile activate {profile.name}")
+        print(f"Install it: modsync install --profile {profile.name}")
+        return 0
+    if args.profile_command == "info":
+        profile = store.get(args.name)
+        _print_profile(profile, active=profile.name == store.active_name())
+        return 0
+    if args.profile_command == "activate":
+        profile = store.activate(args.name)
+        print(f"Active profile: {profile.name}")
+        return 0
+    if not args.yes:
+        answer = input(
+            f"Delete ModSync data for profile {args.name!r}? Game files will not be deleted. "
+            "[y/N] "
+        )
+        if answer.strip().casefold() not in {"y", "yes"}:
+            print("Profile deletion cancelled.")
+            return 0
+    profile = store.delete(args.name)
+    print(f"Profile deleted: {profile.name}")
+    print("Installed game and mod files were not removed.")
+    return 0
+
+
+def main(
+    argv: Sequence[str] | None = None, *, profile_store: ProfileStore | None = None
+) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    store = profile_store or ProfileStore()
     try:
-        modpack = load_modpack(args.modpack)
-        if args.command == "install":
-            return _run_install(modpack, updating=False)
-        if args.command == "update":
-            return _run_install(modpack, updating=True)
-        if args.command == "verify":
-            return _run_verify(modpack)
-        if args.command == "info":
-            return _run_info(modpack)
-        if args.backup_command == "list":
-            return _run_backup_list(modpack)
-        return _run_backup_restore(modpack, args.backup_id)
+        if args.command == "profile":
+            return _run_profile_command(args, store)
+
+        if args.command == "backup" and args.backup_command == "restore":
+            if args.profile is not None:
+                if len(args.target) != 1:
+                    raise ProfileError("Profile restore expects one backup ID")
+                target = _resolve_target(store, None, args.profile)
+                backup_id = args.target[0]
+            elif len(args.target) == 2:
+                target = _resolve_target(store, Path(args.target[0]), None)
+                backup_id = args.target[1]
+            elif len(args.target) == 1:
+                target = _resolve_target(store, None, None)
+                backup_id = args.target[0]
+            else:
+                raise ProfileError("Restore expects modpack.json and backup ID")
+        else:
+            target = _resolve_target(store, args.modpack, args.profile)
+            backup_id = None
+
+        mutating = args.command in {"install", "update"} or (
+            args.command == "backup" and args.backup_command == "restore"
+        )
+        lock = (
+            store.lock(target.profile_name)
+            if mutating and target.profile_name
+            else nullcontext()
+        )
+        with lock:
+            if args.command == "install":
+                result = _run_install(target.modpack, updating=False)
+            elif args.command == "update":
+                result = _run_install(target.modpack, updating=True)
+            elif args.command == "verify":
+                result = _run_verify(target.modpack)
+            elif args.command == "info":
+                result = _run_info(target.modpack)
+            elif args.backup_command == "list":
+                result = _run_backup_list(target.modpack)
+            else:
+                result = _run_backup_restore(target.modpack, backup_id or "")
+            if mutating and target.profile_name is not None:
+                store.touch(target.profile_name)
+            return result
     except ModSyncError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
-    except KeyboardInterrupt:
+    except (EOFError, KeyboardInterrupt):
         print("\nCancelled.", file=sys.stderr)
         return 130
 

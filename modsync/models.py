@@ -28,6 +28,22 @@ class Modpack:
     install_directory: Path
     mods: tuple[Mod, ...]
     source_path: Path
+    state_path: Path | None = None
+    backup_directory: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Profile:
+    """Validated metadata for one stored ModSync profile."""
+
+    name: str
+    game: str
+    install_directory: Path
+    created_at: str
+    updated_at: str
+    modpack_source: Path
+    mod_count: int
+    directory: Path
 
 
 @dataclass(frozen=True, slots=True)

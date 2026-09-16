@@ -8,7 +8,7 @@ from typing import Any
 from .config import mod_directory_name
 from .hashing import sha256_file
 from .models import Mod, Modpack, VerificationIssue, VerificationReport
-from .state import load_state
+from .state import STATE_FILENAME, load_state_file
 
 
 def verify_mod_record(root: Path, mod: Mod, record: object) -> list[str]:
@@ -59,7 +59,8 @@ def verify_mod_record(root: Path, mod: Mod, record: object) -> list[str]:
 
 def verify_modpack(modpack: Modpack) -> VerificationReport:
     """Verify all enabled mods against local state and recorded file hashes."""
-    state = load_state(modpack.install_directory)
+    state_path = modpack.state_path or modpack.install_directory / STATE_FILENAME
+    state = load_state_file(state_path)
     records: dict[str, Any] = state["mods"]
     issues: list[VerificationIssue] = []
     checked = 0

@@ -35,3 +35,19 @@ class BackupIntegrityError(BackupError):
 
 class RollbackError(BackupError):
     """Raised when a backup cannot be restored safely."""
+
+
+class ProfileError(ModSyncError):
+    """Raised when profile data is invalid or a profile operation cannot complete."""
+
+
+class ProfileNotFoundError(ProfileError):
+    """Raised when a requested profile does not exist."""
+
+
+class ProfileExistsError(ProfileError):
+    """Raised when a profile name is already in use."""
+
+
+class ProfileLockError(ProfileError):
+    """Raised when a modifying operation cannot acquire a profile lock."""

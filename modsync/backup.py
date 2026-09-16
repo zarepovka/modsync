@@ -29,8 +29,8 @@ from .state import (
     STATE_FILENAME,
     atomic_write_bytes,
     atomic_write_json,
-    load_state,
-    save_state,
+    load_state_file,
+    save_state_file,
     validate_state,
 )
 
@@ -91,7 +91,8 @@ class BackupManager:
     def __init__(self, modpack: Modpack) -> None:
         self.modpack = modpack
         self.root = modpack.install_directory
-        self.backup_root = self.root / BACKUP_DIRECTORY
+        self.state_path = modpack.state_path or self.root / STATE_FILENAME
+        self.backup_root = modpack.backup_directory or self.root / BACKUP_DIRECTORY
 
     def create(
         self,
@@ -242,9 +243,11 @@ class BackupManager:
             except OSError as exc:
                 raise BackupError(f"Could not prepare backup restore: {exc}") from exc
 
-            state_path = self.root / STATE_FILENAME
+            state_path = self.state_path
             previous_state = self._read_current_state_bytes(state_path)
-            restored_state = self._restored_state(metadata, state_snapshot, load_state(self.root))
+            restored_state = self._restored_state(
+                metadata, state_snapshot, load_state_file(state_path)
+            )
             try:
                 self._apply_restore(staged, current, affected, restored_state)
                 self._verify_restored(metadata, restored_state)
@@ -287,7 +290,7 @@ class BackupManager:
         return removed
 
     def _prepare_backup_root(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.backup_root.parent.mkdir(parents=True, exist_ok=True)
         if self.backup_root.is_symlink():
             raise BackupError("Backup storage must not be a symbolic link")
         self.backup_root.mkdir(exist_ok=True)
@@ -498,7 +501,7 @@ class BackupManager:
                 target.replace(current / directory)
             if entry["existed"]:
                 (staged / directory).replace(target)
-        save_state(self.root, state_snapshot)
+        save_state_file(self.state_path, state_snapshot)
 
     def _restore_interrupted_restore(
         self,
@@ -548,5 +551,5 @@ class BackupManager:
             if actual != expected:
                 raise RollbackError(f"Restored files failed verification: {directory}")
 
-        if load_state(self.root) != state_snapshot:
+        if load_state_file(self.state_path) != state_snapshot:
             raise RollbackError("Restored state failed verification")

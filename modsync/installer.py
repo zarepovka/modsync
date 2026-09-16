@@ -17,7 +17,7 @@ from .downloader import Downloader
 from .exceptions import BackupError, InstallError, ModSyncError
 from .hashing import sha256_file
 from .models import InstallFailure, InstallReport, Mod, Modpack
-from .state import load_state, save_state
+from .state import STATE_FILENAME, load_state_file, save_state_file
 from .verifier import verify_mod_record, verify_modpack
 
 MAX_ZIP_FILES = 20_000
@@ -111,7 +111,8 @@ class Installer:
         """Install missing, changed, or damaged mods with v0.1-compatible behavior."""
         root = modpack.install_directory
         root.mkdir(parents=True, exist_ok=True)
-        state = load_state(root)
+        state_path = modpack.state_path or root / STATE_FILENAME
+        state = load_state_file(state_path)
         records: dict[str, Any] = state["mods"]
         report = InstallReport()
 
@@ -130,7 +131,7 @@ class Installer:
                     self.apply_prepared_mod(root, prepared, workspace / "previous")
                 records[mod.name] = prepared.state_record
                 state["modpack"] = {"name": modpack.name, "version": modpack.version}
-                save_state(root, state)
+                save_state_file(state_path, state)
                 report.installed += 1
             except ModSyncError as exc:
                 report.failures.append(InstallFailure(mod_name=mod.name, message=str(exc)))
@@ -148,7 +149,8 @@ class Installer:
         """Update all changed mods as one backup-protected transaction."""
         root = modpack.install_directory
         root.mkdir(parents=True, exist_ok=True)
-        state = load_state(root)
+        state_path = modpack.state_path or root / STATE_FILENAME
+        state = load_state_file(state_path)
         records: dict[str, Any] = state["mods"]
         report = InstallReport()
         changed: list[Mod] = []
@@ -198,7 +200,7 @@ class Installer:
                     records[prepared.mod.name] = prepared.state_record
                 state["modpack"] = {"name": modpack.name, "version": modpack.version}
                 current_mod = "state"
-                save_state(root, state)
+                save_state_file(state_path, state)
                 current_mod = "verification"
                 verification = verify_modpack(modpack)
                 if not verification.ok:
