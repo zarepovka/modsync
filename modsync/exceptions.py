@@ -13,6 +13,22 @@ class DownloadError(ModSyncError):
     """Raised when a mod cannot be downloaded safely."""
 
 
+class SourceError(ModSyncError):
+    """Raised when a source cannot be validated or resolved."""
+
+
+class SourceNotFoundError(SourceError):
+    """Raised when a requested release or asset does not exist."""
+
+
+class SourceAmbiguousError(SourceError):
+    """Raised when an asset selector matches more than one release asset."""
+
+
+class SourceRateLimitError(SourceError):
+    """Raised when the source service rejects a request due to rate limits."""
+
+
 class InstallError(ModSyncError):
     """Raised when a downloaded mod cannot be installed safely."""
 

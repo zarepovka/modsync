@@ -16,6 +16,7 @@ from .exceptions import ModSyncError, ProfileError
 from .installer import Installer
 from .models import Mod, Modpack, Profile
 from .profiles import ProfileStore
+from .state import STATE_FILENAME, load_state_file
 from .verifier import verify_modpack
 
 
@@ -141,6 +142,8 @@ def _run_verify(modpack: Modpack) -> int:
 
 
 def _run_info(modpack: Modpack) -> int:
+    state_path = modpack.state_path or modpack.install_directory / STATE_FILENAME
+    records = load_state_file(state_path)["mods"]
     print(f"{modpack.name} {modpack.version}")
     print(f"Game: {modpack.game}")
     if modpack.description:
@@ -149,7 +152,11 @@ def _run_info(modpack: Modpack) -> int:
     print(f"Mods: {len(modpack.mods)}")
     for mod in modpack.mods:
         status = "enabled" if mod.enabled else "disabled"
-        print(f"  - {mod.name} {mod.version} [{status}]")
+        source_type = mod.source.type if mod.source is not None else "direct"
+        record = records.get(mod.name)
+        resolved_version = record.get("version") if isinstance(record, dict) else None
+        version = resolved_version or mod.version or "not resolved"
+        print(f"  - {mod.name} {version} [{status}; source: {source_type}]")
     return 0
 
 
@@ -189,7 +196,20 @@ def _resolve_target(
             "No active profile. Use --profile NAME, activate a profile, or provide modpack.json"
         )
     profile = store.get(selected)
+    _warn_shared_install(store, profile.name)
     return _Target(store.load_modpack(profile.name), profile.name)
+
+
+def _warn_shared_install(store: ProfileStore, profile_name: str) -> None:
+    shared = store.shared_install_profiles(profile_name)
+    if not shared:
+        return
+    print(
+        "WARNING: Profiles share the same physical mod directory. "
+        "Their ModSync state and backups remain separate, but installed files may overlap. "
+        f"Other profile(s): {', '.join(shared)}",
+        file=sys.stderr,
+    )
 
 
 def _print_profile(profile: Profile, *, active: bool) -> None:
@@ -217,6 +237,7 @@ def _run_profile_command(args: argparse.Namespace, store: ProfileStore) -> int:
     if args.profile_command == "create":
         profile = store.create(args.name, args.modpack)
         print(f"Profile created: {profile.name}")
+        _warn_shared_install(store, profile.name)
         print(f"Activate it: modsync profile activate {profile.name}")
         print(f"Install it: modsync install --profile {profile.name}")
         return 0

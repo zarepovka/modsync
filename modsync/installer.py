@@ -16,7 +16,8 @@ from .config import mod_directory_name
 from .downloader import Downloader
 from .exceptions import BackupError, InstallError, ModSyncError
 from .hashing import sha256_file
-from .models import InstallFailure, InstallReport, Mod, Modpack
+from .models import InstallFailure, InstallReport, Mod, Modpack, ResolvedMod
+from .sources import SourceRegistry, build_default_registry
 from .state import STATE_FILENAME, load_state_file, save_state_file
 from .verifier import verify_mod_record, verify_modpack
 
@@ -31,6 +32,7 @@ class PreparedMod:
     """A downloaded and verified mod waiting in transaction-owned staging."""
 
     mod: Mod
+    resolved: ResolvedMod
     staged_directory: Path
     state_record: dict[str, Any]
 
@@ -99,9 +101,12 @@ class Installer:
         self,
         downloader: Downloader | None = None,
         backup_manager_factory: BackupManagerFactory = BackupManager,
+        source_registry: SourceRegistry | None = None,
     ) -> None:
         self.downloader = downloader or Downloader()
         self.backup_manager_factory = backup_manager_factory
+        session = getattr(self.downloader, "session", None)
+        self.source_registry = source_registry or build_default_registry(session=session)
 
     def install_modpack(
         self,
@@ -120,14 +125,17 @@ class Installer:
             if not mod.enabled:
                 report.skipped += 1
                 continue
-            existing = records.get(mod.name)
-            if existing is not None and not verify_mod_record(root, mod, existing):
-                report.skipped += 1
-                continue
             try:
+                resolved = self.source_registry.resolve(mod)
+                existing = records.get(mod.name)
+                if existing is not None and not verify_mod_record(
+                    root, mod, existing, resolved=resolved
+                ):
+                    report.skipped += 1
+                    continue
                 with tempfile.TemporaryDirectory(prefix=".modsync-", dir=root) as name:
                     workspace = Path(name)
-                    prepared = self.prepare_mod(workspace, mod, progress)
+                    prepared = self.prepare_mod(workspace, mod, resolved, progress)
                     self.apply_prepared_mod(root, prepared, workspace / "previous")
                 records[mod.name] = prepared.state_record
                 state["modpack"] = {"name": modpack.name, "version": modpack.version}
@@ -153,27 +161,38 @@ class Installer:
         state = load_state_file(state_path)
         records: dict[str, Any] = state["mods"]
         report = InstallReport()
-        changed: list[Mod] = []
+        changed: list[tuple[Mod, ResolvedMod]] = []
 
         for mod in modpack.mods:
             if not mod.enabled:
                 report.skipped += 1
                 continue
+            try:
+                resolved = self.source_registry.resolve(mod)
+            except (ModSyncError, OSError) as exc:
+                report.failures.append(
+                    InstallFailure(mod_name=mod.name, message=self._error_message(exc))
+                )
+                return report
             existing = records.get(mod.name)
-            if existing is not None and not verify_mod_record(root, mod, existing):
+            if existing is not None and not verify_mod_record(
+                root, mod, existing, resolved=resolved
+            ):
                 report.skipped += 1
             else:
-                changed.append(mod)
+                changed.append((mod, resolved))
         if not changed:
             return report
 
         with tempfile.TemporaryDirectory(prefix=".modsync-update-", dir=root) as name:
             transaction = Path(name)
             prepared_mods: list[PreparedMod] = []
-            for mod in changed:
+            for mod, resolved in changed:
                 try:
                     prepared_mods.append(
-                        self.prepare_mod(transaction / mod_directory_name(mod.name), mod, progress)
+                        self.prepare_mod(
+                            transaction / mod_directory_name(mod.name), mod, resolved, progress
+                        )
                     )
                 except (ModSyncError, OSError) as exc:
                     report.failures.append(
@@ -183,7 +202,9 @@ class Installer:
 
             backup_manager = self.backup_manager_factory(modpack)
             try:
-                backup = backup_manager.create(changed, state, reason="update")
+                backup = backup_manager.create(
+                    [mod for mod, _resolved in changed], state, reason="update"
+                )
                 report.backup_id = backup.backup_id
             except (BackupError, OSError) as exc:
                 report.failures.append(
@@ -202,7 +223,10 @@ class Installer:
                 current_mod = "state"
                 save_state_file(state_path, state)
                 current_mod = "verification"
-                verification = verify_modpack(modpack)
+                verification = verify_modpack(
+                    modpack,
+                    resolved_by_name={item.resolved.name: item.resolved for item in prepared_mods},
+                )
                 if not verification.ok:
                     first = verification.issues[0]
                     raise InstallError(
@@ -232,6 +256,7 @@ class Installer:
         self,
         workspace: Path,
         mod: Mod,
+        resolved: ResolvedMod,
         progress: InstallProgressCallback | None,
     ) -> PreparedMod:
         """Download, verify, and extract a mod without touching the installation."""
@@ -241,11 +266,11 @@ class Installer:
         download_progress = None
         if progress is not None:
             download_progress = lambda downloaded, total: progress(mod, downloaded, total)
-        artifact = self.downloader.download(mod, download_directory, download_progress)
+        artifact = self.downloader.download(resolved, download_directory, download_progress)
         artifact_digest = sha256_file(artifact)
-        if mod.sha256 is not None and artifact_digest != mod.sha256:
+        if resolved.sha256 is not None and artifact_digest != resolved.sha256:
             raise InstallError(
-                f"SHA256 mismatch for {mod.name}: expected {mod.sha256}, got {artifact_digest}"
+                f"SHA256 mismatch for {mod.name}: expected {resolved.sha256}, got {artifact_digest}"
             )
 
         staged = workspace / "staged"
@@ -260,10 +285,17 @@ class Installer:
             raise InstallError(f"The downloaded artifact for {mod.name} contains no files")
         return PreparedMod(
             mod=mod,
+            resolved=resolved,
             staged_directory=staged,
             state_record={
-                "version": mod.version,
+                "version": resolved.version,
                 "source_sha256": artifact_digest,
+                "source": {
+                    **resolved.source_metadata,
+                    "identity": resolved.source_identity,
+                    "release": resolved.release_metadata,
+                    "sha256": artifact_digest,
+                },
                 "directory": mod_directory_name(mod.name),
                 "files": files,
             },

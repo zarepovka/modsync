@@ -112,6 +112,18 @@ def test_duplicate_profile_is_rejected_case_insensitively(tmp_path):
         store.create("friends", config)
 
 
+def test_cli_warns_when_profiles_share_install_directory(tmp_path, capsys):
+    config = write_modpack(tmp_path / "modpack.json")
+    store = make_store(tmp_path)
+    store.create("one", config)
+
+    assert main(["profile", "create", "two", str(config)], profile_store=store) == 0
+
+    error = capsys.readouterr().err
+    assert "Profiles share the same physical mod directory" in error
+    assert "state and backups remain separate" in error
+
+
 def test_list_profiles_is_sorted_and_reports_metadata(tmp_path):
     config = write_modpack(tmp_path / "modpack.json")
     store = make_store(tmp_path)

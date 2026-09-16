@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .exceptions import ConfigError
-from .models import Mod, Modpack
+from .models import Mod, Modpack, SourceSpec
 
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -46,11 +46,75 @@ def _parse_mod(value: object, index: int) -> Mod:
         raise ConfigError(f"{context} must be an object")
 
     name = _required_string(value, "name", context)
-    version = _required_string(value, "version", context)
-    url = _required_string(value, "url", context)
-    parsed_url = urlsplit(url)
-    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-        raise ConfigError(f"{context}.url must be a valid HTTP or HTTPS URL")
+    source_value = value.get("source")
+    version_value = value.get("version")
+    if version_value is not None and (
+        not isinstance(version_value, str) or not version_value.strip()
+    ):
+        raise ConfigError(f"{context}.version must be a non-empty string when provided")
+    version = version_value.strip() if isinstance(version_value, str) else None
+    url_value = value.get("url")
+    if url_value is not None and (not isinstance(url_value, str) or not url_value.strip()):
+        raise ConfigError(f"{context}.url must be a non-empty string when provided")
+    url = url_value.strip() if isinstance(url_value, str) else None
+
+    if source_value is None:
+        if version is None:
+            raise ConfigError(f"{context}.version is required for legacy direct URLs")
+        if url is None:
+            raise ConfigError(f"{context}.url or {context}.source is required")
+        source = SourceSpec(type="direct", options={"url": url, "version": version})
+    else:
+        if not isinstance(source_value, dict):
+            raise ConfigError(f"{context}.source must be an object")
+        source_type = _required_string(source_value, "type", f"{context}.source").lower()
+        if source_type == "direct":
+            allowed = {"type", "url", "version"}
+            unexpected = set(source_value) - allowed
+            if unexpected:
+                raise ConfigError(
+                    f"{context}.source contains unsupported fields: {', '.join(sorted(unexpected))}"
+                )
+            source_url = _required_string(source_value, "url", f"{context}.source")
+            source_version_value = source_value.get("version", version)
+            if source_version_value is not None and (
+                not isinstance(source_version_value, str) or not source_version_value.strip()
+            ):
+                raise ConfigError(f"{context}.source.version must be a non-empty string")
+            source_version = (
+                source_version_value.strip() if isinstance(source_version_value, str) else None
+            )
+            source_options = {"url": source_url}
+            if source_version is not None:
+                source_options["version"] = source_version
+            source = SourceSpec(type="direct", options=source_options)
+            url = source_url
+            version = source_version
+        elif source_type == "github":
+            allowed = {"type", "repository", "release", "asset"}
+            unexpected = set(source_value) - allowed
+            if unexpected:
+                raise ConfigError(
+                    f"{context}.source contains unsupported fields: {', '.join(sorted(unexpected))}"
+                )
+            source = SourceSpec(
+                type="github",
+                options={
+                    "repository": _required_string(
+                        source_value, "repository", f"{context}.source"
+                    ),
+                    "release": _required_string(source_value, "release", f"{context}.source"),
+                    "asset": _required_string(source_value, "asset", f"{context}.source"),
+                },
+            )
+            url = None
+        else:
+            raise ConfigError(f"{context}.source.type is unsupported: {source_type}")
+
+    if url is not None:
+        parsed_url = urlsplit(url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            raise ConfigError(f"{context}.url must be a valid HTTP or HTTPS URL")
 
     checksum = value.get("sha256")
     if checksum is not None:
@@ -63,7 +127,14 @@ def _parse_mod(value: object, index: int) -> Mod:
         raise ConfigError(f"{context}.enabled must be true or false")
 
     mod_directory_name(name)
-    return Mod(name=name, version=version, url=url, sha256=checksum, enabled=enabled)
+    return Mod(
+        name=name,
+        version=version,
+        url=url,
+        sha256=checksum,
+        enabled=enabled,
+        source=source,
+    )
 
 
 def load_modpack(path: str | Path) -> Modpack:

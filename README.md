@@ -2,13 +2,15 @@
 
 [![Тесты](https://github.com/zarepovka/modsync/actions/workflows/tests.yml/badge.svg)](https://github.com/zarepovka/modsync/actions/workflows/tests.yml)
 
-> **Статус: v0.3.0 — Profiles**
+> **Статус: v0.4.0 — Sources & GitHub Releases**
 
 ModSync — небольшой кроссплатформенный менеджер модпаков с интерфейсом командной строки. Передайте друзьям файл `modpack.json`, и ModSync скачает включённые моды, проверит их, безопасно обновит установку и сохранит локальное состояние. Профили позволяют вести несколько наборов модов с независимыми state и backup.
 
 ## Возможности
 
 - Установка ZIP-архивов и обычных файлов по HTTP(S)-ссылкам.
+- Получение опубликованных стабильных релизов и assets через официальный GitHub API.
+- Расширяемый реестр источников: установщик не зависит от конкретного провайдера.
 - Потоковая загрузка с отображением прогресса без помещения всего файла в память.
 - Проверка необязательной контрольной суммы SHA256 перед установкой.
 - Безопасная распаковка ZIP с защитой от обхода путей и символических ссылок.
@@ -170,13 +172,74 @@ modsync backup restore modpack.json 20260916T153012Z-a4f21c
 }
 ```
 
-Готовый для редактирования пример находится в файле [`examples/modpack.example.json`](examples/modpack.example.json).
+Готовые для редактирования примеры находятся в файлах [`examples/modpack.example.json`](examples/modpack.example.json) и [`examples/modpack.github.example.json`](examples/modpack.github.example.json).
+
+## Mod Sources
+
+Каждый мод может описывать источник в объекте `source`. Старый формат с полями `version` и `url` остаётся полностью совместимым и не требует миграции.
+
+### Direct URL
+
+Прямая HTTP(S)-ссылка подходит для файлов с фиксированным адресом:
+
+```json
+{
+  "name": "Example",
+  "source": {
+    "type": "direct",
+    "url": "https://example.com/mod.zip"
+  }
+}
+```
+
+Для direct-источника рекомендуется указывать `version` на уровне мода или внутри `source`: без неё ModSync использует значение `unversioned` и не может узнать об изменении удалённого файла по одному и тому же URL.
+
+### GitHub Releases
+
+GitHub-источник получает опубликованный стабильный релиз через официальный API, выбирает ровно один asset и сохраняет tag, release/asset ID, URL, время разрешения и фактический SHA256 в state:
+
+```json
+{
+  "name": "Example",
+  "source": {
+    "type": "github",
+    "repository": "owner/project",
+    "release": "latest",
+    "asset": "Example-*.zip"
+  }
+}
+```
+
+В `release` можно указать `latest` или конкретный tag, например `v1.4.2`. Поле `asset` поддерживает точное имя и glob-шаблон. Совпасть должен ровно один прикреплённый к релизу файл: автоматически созданные GitHub source archives не выбираются.
+
+Публичные репозитории работают без авторизации. При ограничении частоты запросов можно передать personal access token только через переменную окружения:
+
+```bash
+export MODSYNC_GITHUB_TOKEN="..."
+modsync update modpack.json
+```
+
+В PowerShell:
+
+```powershell
+$env:MODSYNC_GITHUB_TOKEN = "..."
+modsync update modpack.json
+```
+
+Не добавляйте токен в `modpack.json`. ModSync передаёт его только в HTTP-заголовке и не сохраняет в state, логах или backup.
+
+Типичные ошибки:
+
+- `rate limit` — подождите сброса лимита или задайте `MODSYNC_GITHUB_TOKEN`;
+- `release not found` — проверьте `owner/repository` и tag в поле `release`;
+- `asset not found` — проверьте имя файла или glob-шаблон;
+- `ambiguous assets` — уточните шаблон так, чтобы он совпадал ровно с одним asset.
 
 ## Структура проекта
 
 ```text
 modsync/
-├── modsync/       # CLI, профили, backup, загрузчик, установщик и проверка
+├── modsync/       # CLI, профили, источники, backup, установщик и проверка
 ├── tests/         # Модульные тесты без реальных сетевых запросов
 ├── examples/      # Пример модпака
 ├── pyproject.toml # Метаданные пакета и точка входа CLI
@@ -197,7 +260,7 @@ python -m pip install ".[dev]"
 python -m pytest
 ```
 
-Тесты проверяют конфигурации, профили, активный профиль, изоляцию state и backup, locking, обратную совместимость CLI, вычисление хешей, безопасную установку ZIP, backup/restore, rollback, retention и ошибки загрузки.
+Тесты проверяют конфигурации, direct/GitHub sources, профили, активный профиль, изоляцию state и backup, locking, обратную совместимость CLI, вычисление хешей, безопасную установку ZIP, backup/restore, rollback, retention и сетевые ошибки. Реальные сетевые запросы в тестах не выполняются.
 
 ## Планы развития
 
@@ -207,8 +270,10 @@ python -m pytest
 - [x] Резервное копирование и откат.
 - Экспорт собственных модпаков.
 - Зависимости между модами.
-- Использование GitHub Releases как источника файлов.
+- [x] Прямые URL как источник файлов.
+- [x] GitHub Releases как источник файлов.
 - Интеграция с Thunderstore.
+- Интеграция с Nexus Mods.
 - Автоматическое обновление ModSync.
 - Синхронизация модпаков между друзьями.
 
@@ -216,13 +281,13 @@ python -m pytest
 
 ## Текущие ограничения
 
-- Поддерживаются только прямые HTTP(S)-ссылки на файлы.
+- Поддерживаются direct URL и GitHub Releases; Thunderstore, Nexus Mods и локальные/custom providers пока не реализованы.
 - Для проверки установленных версий необходимо сохранить локальный файл состояния.
 - Отключённые или удалённые из модпака моды не удаляются автоматически.
 - Backup создаётся автоматически для `update`; отдельной команды ручного создания пока нет.
 - Retention фиксирован на пяти последних backup и пока не настраивается.
 - ModSync не переключает автоматически настройки самой игры; active profile выбирает контекст команд ModSync.
-- Если несколько профилей указывают одинаковый `install_directory`, они по-прежнему хранят раздельные state и backup, но управляют одними и теми же файлами модов.
+- Если несколько профилей указывают одинаковый `install_directory`, ModSync показывает предупреждение. Profiles share the same physical mod directory. Their ModSync state and backups remain separate, but installed files may overlap.
 - Откат использует безопасное best-effort поведение и не заявляет абсолютную транзакционность файловой системы на всех платформах.
 - Пока нет разрешения зависимостей, аутентификации и GUI.
 - ModSync не определяет, является ли скачанный мод безопасным и совместимым с игрой.

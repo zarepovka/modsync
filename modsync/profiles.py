@@ -258,6 +258,16 @@ class ProfileStore:
             raise ProfileError(f"Active profile no longer exists: {active}")
         return active
 
+    def shared_install_profiles(self, name: str) -> list[str]:
+        """List other profiles that point at the same physical installation directory."""
+        profile = self.get(name)
+        target = profile.install_directory.resolve()
+        return [
+            other.name
+            for other in self.list()
+            if other.name != profile.name and other.install_directory.resolve() == target
+        ]
+
     def activate(self, name: str) -> Profile:
         with self.global_lock():
             profile = self.get(name)

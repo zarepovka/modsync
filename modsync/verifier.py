@@ -7,22 +7,37 @@ from typing import Any
 
 from .config import mod_directory_name
 from .hashing import sha256_file
-from .models import Mod, Modpack, VerificationIssue, VerificationReport
+from .models import Mod, Modpack, ResolvedMod, VerificationIssue, VerificationReport
 from .state import STATE_FILENAME, load_state_file
 
 
-def verify_mod_record(root: Path, mod: Mod, record: object) -> list[str]:
+def verify_mod_record(
+    root: Path,
+    mod: Mod,
+    record: object,
+    *,
+    resolved: ResolvedMod | None = None,
+) -> list[str]:
     """Return problems found for one mod and its state record."""
     if not isinstance(record, dict):
         return ["is not recorded as installed"]
 
     problems: list[str] = []
-    if record.get("version") != mod.version:
+    expected_version = resolved.version if resolved is not None else mod.version
+    if expected_version is not None and record.get("version") != expected_version:
         problems.append(
-            f"version mismatch: expected {mod.version}, found {record.get('version', 'unknown')}"
+            f"version mismatch: expected {expected_version}, "
+            f"found {record.get('version', 'unknown')}"
         )
     if mod.sha256 is not None and record.get("source_sha256") != mod.sha256:
         problems.append("downloaded artifact checksum does not match the modpack")
+    if resolved is not None:
+        source = record.get("source")
+        if isinstance(source, dict):
+            if source.get("identity") != resolved.source_identity:
+                problems.append("resolved source release has changed")
+        elif resolved.source_metadata.get("type") != "direct":
+            problems.append("resolved source metadata is missing")
 
     files = record.get("files")
     if not isinstance(files, dict) or not files:
@@ -57,7 +72,11 @@ def verify_mod_record(root: Path, mod: Mod, record: object) -> list[str]:
     return problems
 
 
-def verify_modpack(modpack: Modpack) -> VerificationReport:
+def verify_modpack(
+    modpack: Modpack,
+    *,
+    resolved_by_name: dict[str, ResolvedMod] | None = None,
+) -> VerificationReport:
     """Verify all enabled mods against local state and recorded file hashes."""
     state_path = modpack.state_path or modpack.install_directory / STATE_FILENAME
     state = load_state_file(state_path)
@@ -68,6 +87,9 @@ def verify_modpack(modpack: Modpack) -> VerificationReport:
         if not mod.enabled:
             continue
         checked += 1
-        for message in verify_mod_record(modpack.install_directory, mod, records.get(mod.name)):
+        resolved = resolved_by_name.get(mod.name) if resolved_by_name is not None else None
+        for message in verify_mod_record(
+            modpack.install_directory, mod, records.get(mod.name), resolved=resolved
+        ):
             issues.append(VerificationIssue(mod_name=mod.name, message=message))
     return VerificationReport(checked=checked, issues=tuple(issues))

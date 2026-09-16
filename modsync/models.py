@@ -4,6 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True, slots=True)
+class SourceSpec:
+    """Validated provider configuration for a mod artifact."""
+
+    type: str
+    options: dict[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -11,10 +20,26 @@ class Mod:
     """A mod declared in a modpack."""
 
     name: str
-    version: str
-    url: str
+    version: str | None
+    url: str | None
     sha256: str | None = None
     enabled: bool = True
+    source: SourceSpec | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedMod:
+    """Provider-independent description of one downloadable mod release."""
+
+    name: str
+    version: str
+    download_url: str
+    filename: str
+    sha256: str | None
+    source_metadata: dict[str, Any]
+    release_metadata: dict[str, Any]
+    source_identity: dict[str, Any]
+    request_headers: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True, slots=True)

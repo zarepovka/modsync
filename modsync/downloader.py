@@ -8,8 +8,9 @@ from urllib.parse import unquote, urlsplit
 
 import requests
 
+from . import __version__
 from .exceptions import DownloadError
-from .models import Mod
+from .models import Mod, ResolvedMod
 
 ProgressCallback = Callable[[int, int | None], None]
 
@@ -28,19 +29,26 @@ class Downloader:
 
     def download(
         self,
-        mod: Mod,
+        mod: Mod | ResolvedMod,
         destination: Path,
         progress: ProgressCallback | None = None,
     ) -> Path:
         """Download ``mod`` and return the completed local artifact path."""
-        parsed = urlsplit(mod.url)
+        url = mod.download_url if isinstance(mod, ResolvedMod) else mod.url
+        if not isinstance(url, str):
+            raise DownloadError(f"No resolved download URL for {mod.name}")
+        parsed = urlsplit(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise DownloadError(f"Invalid download URL for {mod.name}: {mod.url}")
+            raise DownloadError(f"Invalid download URL for {mod.name}")
 
-        filename = Path(unquote(parsed.path)).name or f"{mod.name}.download"
+        filename = (
+            mod.filename
+            if isinstance(mod, ResolvedMod)
+            else Path(unquote(parsed.path)).name or f"{mod.name}.download"
+        )
         filename = filename.replace("\x00", "")
-        if not filename:
-            filename = f"{mod.name}.download"
+        if not filename or filename in {".", ".."} or Path(filename).name != filename:
+            raise DownloadError(f"Unsafe download filename for {mod.name}")
         destination.mkdir(parents=True, exist_ok=True)
         completed = destination / filename
         partial = destination / f"{filename}.part"
@@ -48,13 +56,30 @@ class Downloader:
         response = None
         try:
             response = self.session.get(
-                mod.url,
+                url,
                 stream=True,
                 timeout=(10, 60),
                 allow_redirects=True,
-                headers={"User-Agent": "ModSync/0.1"},
+                headers={
+                    "User-Agent": f"ModSync/{__version__}",
+                    **(mod.request_headers if isinstance(mod, ResolvedMod) else {}),
+                },
             )
             response.raise_for_status()
+            final_url = urlsplit(getattr(response, "url", url))
+            if parsed.scheme == "https" and final_url.scheme != "https":
+                raise DownloadError(f"Unsafe redirect while downloading {mod.name}")
+            if (
+                isinstance(mod, ResolvedMod)
+                and mod.source_metadata.get("type") == "github"
+                and final_url.hostname
+                not in {
+                    "github.com",
+                    "objects.githubusercontent.com",
+                    "release-assets.githubusercontent.com",
+                }
+            ):
+                raise DownloadError(f"Unsafe GitHub redirect while downloading {mod.name}")
             raw_length = response.headers.get("Content-Length")
             total = int(raw_length) if raw_length and raw_length.isdigit() else None
             if total is not None and total > self.max_bytes:

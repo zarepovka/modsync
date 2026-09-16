@@ -1,0 +1,20 @@
+{
+  "name": "GitHub Release Example",
+  "version": "1.0.0",
+  "description": "Documentation-only example; replace repository and asset values before use",
+  "game": "Example Game",
+  "install_directory": "./mods",
+  "mods": [
+    {
+      "name": "ExampleMod",
+      "source": {
+        "type": "github",
+        "repository": "owner/project",
+        "release": "latest",
+        "asset": "ExampleMod-*.zip"
+      },
+      "sha256": null,
+      "enabled": true
+    }
+  ]
+}
