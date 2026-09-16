@@ -1,0 +1,34 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python caches and build output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Local settings, secrets, and temporary files
+.env
+.env.*
+*.local.json
+*.tmp
+*.part
+
+# Downloaded/installed mods and local ModSync state
+mods/
+downloads/
+.modsync-state.json
+.modsync-*/

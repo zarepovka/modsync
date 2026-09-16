@@ -1,0 +1,16 @@
+{
+  "name": "Karim Valheim Pack",
+  "version": "1.0.0",
+  "description": "Modpack for playing with friends",
+  "game": "Valheim",
+  "install_directory": "./mods",
+  "mods": [
+    {
+      "name": "ExampleMod",
+      "version": "1.2.0",
+      "url": "https://example.com/ExampleMod.zip",
+      "sha256": null,
+      "enabled": true
+    }
+  ]
+}
