@@ -45,6 +45,32 @@ class InstallReport:
     installed: int = 0
     skipped: int = 0
     failures: list[InstallFailure] = field(default_factory=list)
+    backup_id: str | None = None
+    rollback_attempted: bool = False
+    rollback_succeeded: bool | None = None
+    rollback_error: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class BackupInfo:
+    """Validated summary of one stored backup."""
+
+    backup_id: str
+    created_at: str
+    modpack_name: str
+    modpack_version: str
+    reason: str
+    file_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreReport:
+    """Summary of a successful manual or automatic restore."""
+
+    backup_id: str
+    restored_files: int
+    state_restored: bool
 
 
 @dataclass(frozen=True, slots=True)

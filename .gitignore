@@ -31,4 +31,5 @@ Thumbs.db
 mods/
 downloads/
 .modsync-state.json
+.modsync-backups/
 .modsync-*/
