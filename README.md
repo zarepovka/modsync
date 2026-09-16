@@ -1,55 +1,55 @@
 # ModSync
 
-> **Status: Early Development / MVP**
+> **Статус: ранняя разработка / MVP**
 
-ModSync is a small cross-platform command-line manager for shareable modpacks. Give friends a `modpack.json`; ModSync downloads each enabled mod, verifies its checksum, installs it into an isolated directory, and records enough state to detect missing or damaged files later.
+ModSync — небольшой кроссплатформенный менеджер модпаков с интерфейсом командной строки. Передайте друзьям файл `modpack.json`, и ModSync скачает каждый включённый мод, проверит его контрольную сумму, установит в отдельную директорию и сохранит локальное состояние для последующего обнаружения отсутствующих или повреждённых файлов.
 
-## Features
+## Возможности
 
-- Install ZIP archives and regular files from HTTP(S) URLs.
-- Stream downloads with progress instead of loading them into memory.
-- Verify optional source SHA256 checksums before installation.
-- Safely extract ZIPs with traversal and symbolic-link protection.
-- Track versions and per-file SHA256 checksums locally.
-- Repair missing or damaged mods and update only changed mods.
-- Continue processing the pack when one download fails.
+- Установка ZIP-архивов и обычных файлов по HTTP(S)-ссылкам.
+- Потоковая загрузка с отображением прогресса без помещения всего файла в память.
+- Проверка необязательной контрольной суммы SHA256 перед установкой.
+- Безопасная распаковка ZIP с защитой от обхода путей и символических ссылок.
+- Локальное хранение версий и SHA256 каждого установленного файла.
+- Восстановление отсутствующих или повреждённых модов и обновление только изменившихся модов.
+- Продолжение обработки модпака, даже если один из файлов не удалось скачать.
 
-## Requirements
+## Требования
 
-- Python 3.12 or newer
-- Windows, macOS, or Linux
-- Network access to the URLs listed in the modpack
+- Python 3.12 или новее;
+- Windows, macOS или Linux;
+- доступ к URL-адресам, указанным в модпаке.
 
-## Installation
+## Установка
 
-Clone or download this repository, then create an isolated environment:
+Клонируйте или скачайте репозиторий, затем создайте изолированное окружение:
 
 ```bash
 cd modsync
 python -m venv .venv
 ```
 
-Activate it on macOS/Linux:
+Активируйте его в macOS или Linux:
 
 ```bash
 source .venv/bin/activate
 ```
 
-Or on Windows PowerShell:
+Или в Windows PowerShell:
 
 ```powershell
 .venv\Scripts\Activate.ps1
 ```
 
-Install ModSync:
+Установите ModSync:
 
 ```bash
 python -m pip install .
 ```
 
-For development and tests, use `python -m pip install ".[dev]"`. Reinstall after changing the package before testing the generated `modsync` command.
+Для разработки и запуска тестов используйте `python -m pip install ".[dev]"`. После изменения исходного кода переустановите пакет перед проверкой сгенерированной команды `modsync`.
 
-## Usage
+## Использование
 
 ```bash
 modsync install modpack.json
@@ -58,17 +58,17 @@ modsync update modpack.json
 modsync info modpack.json
 ```
 
-`install` and `update` are idempotent: a mod whose version and installed files already match is skipped. Missing, changed, or damaged mods are downloaded again. Disabled mods remain untouched.
+Команды `install` и `update` идемпотентны: если версия мода и его установленные файлы уже соответствуют модпаку, мод будет пропущен. Отсутствующие, изменённые или повреждённые моды загружаются повторно. Отключённые моды остаются нетронутыми.
 
-## Modpack format
+## Формат модпака
 
-Paths in `install_directory` are resolved relative to the JSON file. Mod names must be unique. SHA256 is optional, but strongly recommended when publishers provide a trusted digest.
+Путь `install_directory` определяется относительно JSON-файла. Названия модов должны быть уникальными. Поле SHA256 необязательно, однако его настоятельно рекомендуется заполнять, если издатель предоставляет доверенную контрольную сумму.
 
 ```json
 {
   "name": "Karim Valheim Pack",
   "version": "1.0.0",
-  "description": "Modpack for playing with friends",
+  "description": "Модпак для игры с друзьями",
   "game": "Valheim",
   "install_directory": "./mods",
   "mods": [
@@ -83,58 +83,58 @@ Paths in `install_directory` are resolved relative to the JSON file. Mod names m
 }
 ```
 
-See [`examples/modpack.example.json`](examples/modpack.example.json) for a ready-to-edit copy.
+Готовый для редактирования пример находится в файле [`examples/modpack.example.json`](examples/modpack.example.json).
 
-## Project structure
+## Структура проекта
 
 ```text
 modsync/
-├── modsync/       # CLI, configuration, downloader, installer, and verifier
-├── tests/         # Unit tests with no live network requests
-├── examples/      # Example modpack
-├── pyproject.toml # Package metadata and console entry point
+├── modsync/       # CLI, конфигурация, загрузчик, установщик и проверка
+├── tests/         # Модульные тесты без реальных сетевых запросов
+├── examples/      # Пример модпака
+├── pyproject.toml # Метаданные пакета и точка входа CLI
 ├── README.md
 └── LICENSE
 ```
 
-## Security
+## Безопасность
 
-ModSync treats every download as untrusted data. It never executes downloaded files. ZIP entries are checked before extraction; absolute paths, parent traversal, drive-qualified paths, and symbolic links are rejected. Archive entry-count and expanded-size limits reduce common ZIP bomb risks. Installation is staged beneath the configured install directory, and TLS verification remains enabled by `requests`.
+ModSync считает каждую загрузку недоверенными данными и никогда не запускает скачанные файлы. Все элементы ZIP проверяются перед распаковкой: абсолютные пути, переходы в родительские директории, пути с указанием диска и символические ссылки отклоняются. Ограничения на количество элементов и суммарный размер распакованных данных снижают риски, связанные с ZIP-бомбами. Установка сначала выполняется во временную директорию внутри настроенного каталога, а проверка TLS в `requests` всегда остаётся включённой.
 
-For best protection, use HTTPS URLs and fill in `sha256` from a trusted source. A checksum proves file identity, not that a mod itself is safe. Review mods and their publishers before loading them into a game.
+Для максимальной защиты используйте HTTPS-ссылки и указывайте `sha256`, полученный из доверенного источника. Контрольная сумма подтверждает идентичность файла, но не безопасность самого мода. Проверяйте моды и их издателей перед загрузкой в игру.
 
-## Development
+## Разработка
 
 ```bash
 python -m pip install ".[dev]"
 python -m pytest
 ```
 
-Tests cover valid and invalid configuration, hashing, version checks, safe ZIP installation, ZIP Slip rejection, missing mods, and failed downloads.
+Тесты проверяют корректные и некорректные конфигурации, вычисление хешей, версии, безопасную установку ZIP, защиту от ZIP Slip, отсутствующие моды и ошибки загрузки.
 
-## Roadmap
+## Планы развития
 
-- GUI
-- Multiple game profiles
-- Automatic game detection
-- Rollback and backup
-- Exporting custom modpacks
-- Mod dependencies
-- GitHub Releases as a download source
-- Thunderstore integration
-- ModSync self-update
-- Friend-to-friend modpack synchronization
+- Графический интерфейс.
+- Несколько игровых профилей.
+- Автоматическое определение игры.
+- Резервное копирование и откат.
+- Экспорт собственных модпаков.
+- Зависимости между модами.
+- Использование GitHub Releases как источника файлов.
+- Интеграция с Thunderstore.
+- Автоматическое обновление ModSync.
+- Синхронизация модпаков между друзьями.
 
-These are planned directions, not features of the current MVP.
+Это планы на будущее, а не возможности текущей MVP-версии.
 
-## Current limitations
+## Текущие ограничения
 
-- Sources are direct HTTP(S) file URLs only.
-- The state file must remain present to verify installed versions.
-- Disabled or removed mods are not automatically deleted.
-- There is no rollback, backup, dependency resolver, authentication, or GUI.
-- ModSync does not determine whether a downloaded mod is trustworthy or compatible with a game.
+- Поддерживаются только прямые HTTP(S)-ссылки на файлы.
+- Для проверки установленных версий необходимо сохранить локальный файл состояния.
+- Отключённые или удалённые из модпака моды не удаляются автоматически.
+- Пока нет отката, резервного копирования, разрешения зависимостей, аутентификации и GUI.
+- ModSync не определяет, является ли скачанный мод безопасным и совместимым с игрой.
 
-## License
+## Лицензия
 
-ModSync is available under the [MIT License](LICENSE).
+ModSync распространяется на условиях [лицензии MIT](LICENSE).
