@@ -1,5 +1,7 @@
 # ModSync
 
+[![Тесты](https://github.com/zarepovka/modsync/actions/workflows/tests.yml/badge.svg)](https://github.com/zarepovka/modsync/actions/workflows/tests.yml)
+
 > **Статус: ранняя разработка / MVP**
 
 ModSync — небольшой кроссплатформенный менеджер модпаков с интерфейсом командной строки. Передайте друзьям файл `modpack.json`, и ModSync скачает каждый включённый мод, проверит его контрольную сумму, установит в отдельную директорию и сохранит локальное состояние для последующего обнаружения отсутствующих или повреждённых файлов.
