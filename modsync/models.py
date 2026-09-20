@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -68,6 +68,29 @@ class Modpack:
     source_path: Path
     state_path: Path | None = None
     backup_directory: Path | None = None
+    game_adapter_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InstallationPlanEntry:
+    """One prevalidated file operation produced by a game adapter."""
+
+    staged_file: Path
+    destination: PurePosixPath
+    owner: str
+    mod_name: str
+    action: str = "install"
+    metadata: dict[str, Any] = field(default_factory=dict)
+    conflicts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class InstallationPlan:
+    """Complete set of game-file operations built before installation starts."""
+
+    game_id: str
+    game_root: Path
+    entries: tuple[InstallationPlanEntry, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +127,9 @@ class InstallReport:
     rollback_succeeded: bool | None = None
     rollback_error: str | None = None
     warnings: list[str] = field(default_factory=list)
+    resolved: int = 0
+    planned_files: int = 0
+    plan_entries: tuple[InstallationPlanEntry, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

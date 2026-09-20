@@ -36,6 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
         command = subparsers.add_parser(name, help=help_text)
         command.add_argument("modpack", nargs="?", type=Path, help="Path to modpack.json")
         command.add_argument("--profile", help="Use a stored profile instead of modpack.json")
+        if name in {"install", "update"}:
+            command.add_argument(
+                "--dry-run",
+                action="store_true",
+                help="Resolve, download, validate, and print the plan without changing the game",
+            )
 
     backup = subparsers.add_parser("backup", help="List or restore installation backups")
     backup_commands = backup.add_subparsers(dest="backup_command", required=True)
@@ -87,8 +93,10 @@ def _progress(mod: Mod) -> Callable[[int, int | None], None]:
     return display
 
 
-def _run_install(modpack: Modpack, *, updating: bool) -> int:
+def _run_install(modpack: Modpack, *, updating: bool, dry_run: bool = False) -> int:
     label = "Updating" if updating else "Installing"
+    if dry_run:
+        label = "Planning"
     print(f"{label} {modpack.name} {modpack.version} into {modpack.install_directory}")
     last_mod: str | None = None
 
@@ -101,13 +109,20 @@ def _run_install(modpack: Modpack, *, updating: bool) -> int:
 
     installer = Installer()
     if updating:
-        report = installer.update_modpack(modpack, progress)
+        report = installer.update_modpack(modpack, progress, dry_run=dry_run)
     else:
-        report = installer.install_modpack(modpack, progress)
+        report = installer.install_modpack(modpack, progress, dry_run=dry_run)
     if last_mod is not None:
         print()
     if report.backup_id is not None:
         print(f"Backup created: {report.backup_id}")
+    if dry_run and not report.failures:
+        print(f"{report.resolved} packages resolved")
+        print(f"{report.planned_files} files will be installed")
+        for entry in report.plan_entries:
+            print(f"  {entry.destination.as_posix()}")
+        print("No conflicts detected.")
+        return 0
     print(
         f"Done: {report.installed} installed, {report.skipped} skipped, "
         f"{len(report.failures)} failed."
@@ -312,7 +327,8 @@ def main(
             target = _resolve_target(store, args.modpack, args.profile)
             backup_id = None
 
-        mutating = args.command in {"install", "update"} or (
+        dry_run = bool(getattr(args, "dry_run", False))
+        mutating = (args.command in {"install", "update"} and not dry_run) or (
             args.command == "backup" and args.backup_command == "restore"
         )
         lock = (
@@ -322,9 +338,9 @@ def main(
         )
         with lock:
             if args.command == "install":
-                result = _run_install(target.modpack, updating=False)
+                result = _run_install(target.modpack, updating=False, dry_run=dry_run)
             elif args.command == "update":
-                result = _run_install(target.modpack, updating=True)
+                result = _run_install(target.modpack, updating=True, dry_run=dry_run)
             elif args.command == "verify":
                 result = _run_verify(target.modpack)
             elif args.command == "info":

@@ -24,7 +24,7 @@ from .exceptions import (
     StateError,
 )
 from .hashing import sha256_file
-from .models import BackupInfo, Mod, Modpack, RestoreReport
+from .models import BackupInfo, InstallationPlanEntry, Mod, Modpack, RestoreReport
 from .state import (
     STATE_FILENAME,
     atomic_write_bytes,
@@ -189,6 +189,93 @@ class BackupManager:
             shutil.rmtree(temporary, ignore_errors=True)
             raise BackupError(f"Could not create backup {backup_id}: {exc}") from exc
 
+    def create_paths(
+        self,
+        entries: Sequence[InstallationPlanEntry],
+        state: dict[str, Any],
+        *,
+        reason: str = "update",
+    ) -> BackupInfo:
+        """Create a schema-v2 backup for adapter-selected destination files."""
+        if not entries:
+            raise BackupError("Cannot create a backup without affected files")
+        try:
+            validate_state(state)
+            self._prepare_backup_root()
+            created = datetime.now(UTC)
+            backup_id = self._new_backup_id(created)
+            temporary = Path(tempfile.mkdtemp(prefix=".creating-", dir=self.backup_root))
+        except (OSError, StateError) as exc:
+            raise BackupError(f"Could not prepare backup storage: {exc}") from exc
+
+        try:
+            files_root = temporary / "files"
+            files_root.mkdir()
+            affected_files: list[dict[str, object]] = []
+            saved_files: list[dict[str, str]] = []
+            seen: set[str] = set()
+            mod_names: list[str] = []
+            for entry in entries:
+                relative = _safe_relative_path(entry.destination.as_posix(), "affected file path")
+                value = relative.as_posix()
+                if value in seen:
+                    raise BackupError(f"Duplicate affected file: {value}")
+                seen.add(value)
+                if entry.mod_name not in mod_names:
+                    mod_names.append(entry.mod_name)
+                source = self.root.joinpath(*relative.parts)
+                existed = source.exists() or source.is_symlink()
+                if existed:
+                    _ensure_regular_file(source, "installed game file")
+                    destination = files_root.joinpath(*relative.parts)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination, follow_symlinks=False)
+                    digest = sha256_file(destination)
+                    saved_files.append({"path": value, "sha256": digest})
+                affected_files.append(
+                    {"path": value, "owner": entry.owner, "existed": existed}
+                )
+
+            state_path = temporary / "state.json"
+            atomic_write_json(state_path, state)
+            records: dict[str, Any] = state["mods"]
+            affected_mods = [
+                {
+                    "name": name,
+                    "version": records.get(name, {}).get("version")
+                    if isinstance(records.get(name), dict)
+                    else None,
+                    "existed": name in records,
+                }
+                for name in mod_names
+            ]
+            installed_pack = state.get("modpack", {})
+            installed_version = installed_pack.get("version")
+            if not isinstance(installed_version, str) or not installed_version:
+                installed_version = self.modpack.version
+            metadata = {
+                "schema_version": 2,
+                "backup_id": backup_id,
+                "created_at": created.isoformat().replace("+00:00", "Z"),
+                "modpack": {"name": self.modpack.name, "version": installed_version},
+                "target_modpack_version": self.modpack.version,
+                "reason": reason,
+                "file_count": len(saved_files),
+                "state_sha256": sha256_file(state_path),
+                "affected_mods": affected_mods,
+                "affected_files": affected_files,
+                "saved_files": sorted(saved_files, key=lambda item: item["path"]),
+            }
+            atomic_write_json(temporary / "metadata.json", metadata)
+            temporary.replace(self.backup_root / backup_id)
+            return self._info_from_metadata(metadata)
+        except BackupError:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+        except (OSError, BackupIntegrityError) as exc:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise BackupError(f"Could not create backup {backup_id}: {exc}") from exc
+
     def list_backups(self) -> list[BackupInfo]:
         """Return validated backup summaries, newest first."""
         if not self.backup_root.exists():
@@ -211,6 +298,8 @@ class BackupManager:
     def restore(self, backup_id: str) -> RestoreReport:
         """Fully validate and safely restore a backup with best-effort atomicity."""
         metadata, state_snapshot = self._load_and_validate(backup_id, verify_files=True)
+        if metadata["schema_version"] == 2:
+            return self._restore_paths(backup_id, metadata, state_snapshot)
         backup_directory = self.backup_root / backup_id
         affected = metadata["affected_mods"]
         saved_files = metadata["saved_files"]
@@ -271,6 +360,67 @@ class BackupManager:
             restored_files=metadata["file_count"],
             state_restored=True,
         )
+
+    def _restore_paths(
+        self, backup_id: str, metadata: dict[str, Any], state_snapshot: dict[str, Any]
+    ) -> RestoreReport:
+        """Restore schema-v2 adapter backups without inferring package routing."""
+        backup_directory = self.backup_root / backup_id
+        self.root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".modsync-restore-", dir=self.root) as name:
+            transaction = Path(name)
+            staged = transaction / "staged"
+            current = transaction / "current"
+            staged.mkdir()
+            current.mkdir()
+            for saved in metadata["saved_files"]:
+                relative = _safe_relative_path(saved["path"], "saved file path")
+                source = backup_directory / "files" / Path(*relative.parts)
+                destination = staged / Path(*relative.parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination, follow_symlinks=False)
+
+            state_path = self.state_path
+            previous_state = self._read_current_state_bytes(state_path)
+            restored_state = self._restored_state(
+                metadata, state_snapshot, load_state_file(state_path)
+            )
+            moved: list[tuple[Path, Path | None]] = []
+            try:
+                for index, affected in enumerate(metadata["affected_files"]):
+                    relative = _safe_relative_path(affected["path"], "affected file path")
+                    target = self.root.joinpath(*relative.parts)
+                    if target.is_symlink():
+                        raise RollbackError(f"Refusing to restore through symbolic link: {relative}")
+                    preserved: Path | None = None
+                    if target.exists():
+                        _ensure_regular_file(target, "current game file", reject_hardlinks=False)
+                        preserved = current / str(index)
+                        target.replace(preserved)
+                    if affected["existed"]:
+                        source = staged.joinpath(*relative.parts)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        source.replace(target)
+                    moved.append((target, preserved))
+                save_state_file(state_path, restored_state)
+                for saved in metadata["saved_files"]:
+                    relative = _safe_relative_path(saved["path"], "saved file path")
+                    target = self.root.joinpath(*relative.parts)
+                    if not target.is_file() or sha256_file(target) != saved["sha256"]:
+                        raise RollbackError(f"Restored file failed verification: {relative}")
+            except Exception as original:
+                for target, preserved in reversed(moved):
+                    target.unlink(missing_ok=True)
+                    if preserved is not None and preserved.exists():
+                        preserved.replace(target)
+                if previous_state is None:
+                    state_path.unlink(missing_ok=True)
+                else:
+                    atomic_write_bytes(state_path, previous_state)
+                if isinstance(original, BackupError):
+                    raise
+                raise RollbackError(f"Restore of {backup_id} failed: {original}") from original
+        return RestoreReport(backup_id, len(metadata["saved_files"]), True)
 
     def prune(self, retention: int = DEFAULT_RETENTION) -> list[str]:
         """Delete backups older than the retention count after a successful update."""
@@ -366,8 +516,11 @@ class BackupManager:
         return metadata, state_snapshot
 
     def _validate_metadata(self, metadata: object, backup_id: str) -> None:
-        if not isinstance(metadata, dict) or metadata.get("schema_version") != 1:
+        if not isinstance(metadata, dict) or metadata.get("schema_version") not in {1, 2}:
             raise BackupIntegrityError(f"Unsupported metadata for backup {backup_id}")
+        if metadata.get("schema_version") == 2:
+            self._validate_path_metadata(metadata, backup_id)
+            return
         if metadata.get("backup_id") != backup_id:
             raise BackupIntegrityError(f"Backup ID mismatch in metadata: {backup_id}")
         created_at = metadata.get("created_at")
@@ -436,6 +589,61 @@ class BackupManager:
             if relative.as_posix() in paths or relative.parts[0] not in existing_directories:
                 raise BackupIntegrityError(f"Invalid saved file path in backup {backup_id}")
             paths.add(relative.as_posix())
+        if metadata.get("file_count") != len(saved_files):
+            raise BackupIntegrityError(f"File count mismatch in backup {backup_id}")
+
+    def _validate_path_metadata(self, metadata: dict[str, Any], backup_id: str) -> None:
+        """Validate the complete schema-v2 contract before any restore mutation."""
+        if metadata.get("backup_id") != backup_id:
+            raise BackupIntegrityError(f"Backup ID mismatch in metadata: {backup_id}")
+        created_at = metadata.get("created_at")
+        try:
+            parsed = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise BackupIntegrityError(f"Invalid creation time in backup {backup_id}") from exc
+        if parsed.tzinfo is None or parsed.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ") != backup_id[:16]:
+            raise BackupIntegrityError(f"Backup creation time does not match its ID: {backup_id}")
+        modpack = metadata.get("modpack")
+        if not isinstance(modpack, dict) or modpack.get("name") != self.modpack.name:
+            raise BackupIntegrityError(f"Backup {backup_id} belongs to a different modpack")
+        if not isinstance(modpack.get("version"), str):
+            raise BackupIntegrityError(f"Invalid modpack metadata in backup {backup_id}")
+        if not isinstance(metadata.get("target_modpack_version"), str):
+            raise BackupIntegrityError(f"Invalid target version in backup {backup_id}")
+        if not isinstance(metadata.get("reason"), str) or not metadata["reason"]:
+            raise BackupIntegrityError(f"Invalid reason in backup {backup_id}")
+        if not isinstance(metadata.get("state_sha256"), str) or not _SHA256_RE.fullmatch(metadata["state_sha256"]):
+            raise BackupIntegrityError(f"Invalid state checksum in backup {backup_id}")
+        affected_mods = metadata.get("affected_mods")
+        if not isinstance(affected_mods, list) or not affected_mods:
+            raise BackupIntegrityError(f"Backup {backup_id} has no affected mods")
+        for item in affected_mods:
+            if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not isinstance(item.get("existed"), bool):
+                raise BackupIntegrityError(f"Invalid affected mod in backup {backup_id}")
+        affected_files = metadata.get("affected_files")
+        saved_files = metadata.get("saved_files")
+        if not isinstance(affected_files, list) or not isinstance(saved_files, list):
+            raise BackupIntegrityError(f"Invalid file lists in backup {backup_id}")
+        paths: set[str] = set()
+        existed: set[str] = set()
+        for item in affected_files:
+            if not isinstance(item, dict) or not isinstance(item.get("owner"), str) or not isinstance(item.get("existed"), bool):
+                raise BackupIntegrityError(f"Invalid affected file in backup {backup_id}")
+            relative = _safe_relative_path(item.get("path"), "affected file path")
+            if relative.as_posix() in paths:
+                raise BackupIntegrityError(f"Duplicate affected file in backup {backup_id}")
+            paths.add(relative.as_posix())
+            if item["existed"]:
+                existed.add(relative.as_posix())
+        saved_paths: set[str] = set()
+        for item in saved_files:
+            if not isinstance(item, dict):
+                raise BackupIntegrityError(f"Invalid saved file in backup {backup_id}")
+            relative = _safe_relative_path(item.get("path"), "saved file path")
+            digest = item.get("sha256")
+            if relative.as_posix() not in existed or relative.as_posix() in saved_paths or not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+                raise BackupIntegrityError(f"Invalid saved file in backup {backup_id}")
+            saved_paths.add(relative.as_posix())
         if metadata.get("file_count") != len(saved_files):
             raise BackupIntegrityError(f"File count mismatch in backup {backup_id}")
 

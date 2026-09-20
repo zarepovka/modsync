@@ -46,6 +46,36 @@ def verify_mod_record(
         elif resolved.source_metadata.get("type") != "direct":
             problems.append("resolved source metadata is missing")
 
+    installed_files = record.get("installed_files")
+    if installed_files is not None:
+        if not isinstance(installed_files, list) or not installed_files:
+            problems.append("has no recorded installed files")
+            return problems
+        expected_owner = record.get("owner")
+        for entry in installed_files:
+            if not isinstance(entry, dict):
+                problems.append("contains an invalid ownership record")
+                continue
+            relative = entry.get("path")
+            owner = entry.get("owner")
+            expected_digest = entry.get("sha256")
+            if not all(isinstance(value, str) for value in (relative, owner, expected_digest)):
+                problems.append("contains an invalid ownership record")
+                continue
+            if expected_owner is not None and owner != expected_owner:
+                problems.append(f"ownership mismatch: {relative}")
+            candidate = root / Path(relative)
+            try:
+                candidate.resolve(strict=False).relative_to(root.resolve(strict=False))
+            except ValueError:
+                problems.append(f"contains an unsafe recorded path: {relative}")
+                continue
+            if candidate.is_symlink() or not candidate.is_file():
+                problems.append(f"missing file: {relative}")
+            elif sha256_file(candidate) != expected_digest:
+                problems.append(f"checksum mismatch: {relative}")
+        return problems
+
     files = record.get("files")
     if not isinstance(files, dict) or not files:
         problems.append("has no recorded installed files")

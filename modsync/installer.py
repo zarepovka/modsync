@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import stat
 import tempfile
+import uuid
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from .config import mod_directory_name
 from .downloader import Downloader
 from .exceptions import BackupError, InstallError, ModSyncError
 from .hashing import sha256_file
+from .games import GameRegistry, build_default_game_registry, validate_plan
 from .models import (
     InstallFailure,
     InstallReport,
@@ -23,9 +25,10 @@ from .models import (
     Modpack,
     ResolvedMod,
     ResolvedPlanItem,
+    InstallationPlan,
 )
 from .sources import SourceRegistry, build_default_registry
-from .state import STATE_FILENAME, load_state_file, save_state_file
+from .state import STATE_FILENAME, atomic_write_bytes, load_state_file, save_state_file
 from .verifier import verify_mod_record, verify_resolved_plan
 
 MAX_ZIP_FILES = 20_000
@@ -109,18 +112,28 @@ class Installer:
         downloader: Downloader | None = None,
         backup_manager_factory: BackupManagerFactory = BackupManager,
         source_registry: SourceRegistry | None = None,
+        game_registry: GameRegistry | None = None,
     ) -> None:
         self.downloader = downloader or Downloader()
         self.backup_manager_factory = backup_manager_factory
         session = getattr(self.downloader, "session", None)
         self.source_registry = source_registry or build_default_registry(session=session)
+        self.game_registry = game_registry or build_default_game_registry()
 
     def install_modpack(
         self,
         modpack: Modpack,
         progress: InstallProgressCallback | None = None,
+        *,
+        dry_run: bool = False,
     ) -> InstallReport:
         """Install missing, changed, or damaged mods with v0.1-compatible behavior."""
+        if modpack.game_adapter_id is not None:
+            return self._install_with_adapter(
+                modpack, progress=progress, updating=False, dry_run=dry_run
+            )
+        if dry_run:
+            raise InstallError("Dry-run is available for adapter-based modpacks")
         root = modpack.install_directory
         root.mkdir(parents=True, exist_ok=True)
         state_path = modpack.state_path or root / STATE_FILENAME
@@ -176,8 +189,16 @@ class Installer:
         self,
         modpack: Modpack,
         progress: InstallProgressCallback | None = None,
+        *,
+        dry_run: bool = False,
     ) -> InstallReport:
         """Update all changed mods as one backup-protected transaction."""
+        if modpack.game_adapter_id is not None:
+            return self._install_with_adapter(
+                modpack, progress=progress, updating=True, dry_run=dry_run
+            )
+        if dry_run:
+            raise InstallError("Dry-run is available for adapter-based modpacks")
         root = modpack.install_directory
         root.mkdir(parents=True, exist_ok=True)
         state_path = modpack.state_path or root / STATE_FILENAME
@@ -309,6 +330,194 @@ class Installer:
                 "files": files,
             },
         )
+
+    def _install_with_adapter(
+        self,
+        modpack: Modpack,
+        *,
+        progress: InstallProgressCallback | None,
+        updating: bool,
+        dry_run: bool,
+    ) -> InstallReport:
+        """Run the provider-neutral, adapter-planned installation pipeline."""
+        report = InstallReport(skipped=sum(1 for mod in modpack.mods if not mod.enabled))
+        try:
+            adapter = self.game_registry.get(modpack.game_adapter_id or modpack.game)
+            adapter.validate_game(modpack.install_directory)
+        except (ModSyncError, OSError) as exc:
+            report.failures.append(InstallFailure("game", self._error_message(exc)))
+            return report
+
+        resolved_plan = self._resolve_plan(modpack, report)
+        if resolved_plan is None:
+            return report
+        report.resolved = len(resolved_plan)
+        self._collect_warnings(resolved_plan, report)
+        state_path = modpack.state_path or modpack.install_directory / STATE_FILENAME
+        state = load_state_file(state_path)
+        records: dict[str, Any] = state["mods"]
+        changed: list[ResolvedPlanItem] = []
+        for item in resolved_plan:
+            existing = records.get(item.mod.name)
+            if existing is not None and not verify_mod_record(
+                modpack.install_directory, item.mod, existing, resolved=item.resolved
+            ):
+                report.skipped += 1
+            else:
+                changed.append(item)
+        if not changed:
+            return report
+
+        temporary_parent = modpack.install_directory if not dry_run else None
+        prefix = ".modsync-plan-" if dry_run else ".modsync-adapter-"
+        with tempfile.TemporaryDirectory(prefix=prefix, dir=temporary_parent) as name:
+            transaction = Path(name)
+            prepared = self._prepare_plan(transaction, changed, progress, report)
+            if prepared is None:
+                return report
+            try:
+                plan = adapter.build_installation_plan(
+                    modpack.install_directory,
+                    ((item.mod.name, item.resolved, item.staged_directory) for item in prepared),
+                )
+                managed = self._managed_owners(records)
+                validate_plan(plan, managed_owners=managed)
+            except (ModSyncError, OSError) as exc:
+                report.failures.append(InstallFailure("plan", self._error_message(exc)))
+                return report
+            report.planned_files = len(plan.entries)
+            report.plan_entries = plan.entries
+            if dry_run:
+                return report
+
+            backup_manager = self.backup_manager_factory(modpack)
+            if updating:
+                try:
+                    backup = backup_manager.create_paths(
+                        plan.entries, state, reason="update"
+                    )
+                    report.backup_id = backup.backup_id
+                except (BackupError, OSError) as exc:
+                    report.failures.append(
+                        InstallFailure("update", self._error_message(exc))
+                    )
+                    return report
+
+            applied: list[tuple[Path, Path | None]] = []
+            previous_state = state_path.read_bytes() if state_path.exists() else None
+            try:
+                applied = self._apply_adapter_plan(plan, transaction / "rollback")
+                entries_by_mod: dict[str, list[Any]] = {}
+                for entry in plan.entries:
+                    entries_by_mod.setdefault(entry.mod_name, []).append(entry)
+                for item, prepared_item in zip(changed, prepared, strict=True):
+                    record = prepared_item.state_record
+                    owned_entries = entries_by_mod.get(item.mod.name, [])
+                    record.pop("directory", None)
+                    record["adapter"] = adapter.game_id
+                    record["owner"] = owned_entries[0].owner if owned_entries else mod_directory_name(item.mod.name)
+                    record["installed_files"] = [
+                        {
+                            "path": entry.destination.as_posix(),
+                            "owner": entry.owner,
+                            "sha256": sha256_file(entry.staged_file),
+                        }
+                        for entry in owned_entries
+                    ]
+                    record["files"] = {
+                        entry.destination.as_posix(): sha256_file(entry.staged_file)
+                        for entry in owned_entries
+                    }
+                    records[item.mod.name] = record
+                state["modpack"] = {"name": modpack.name, "version": modpack.version}
+                save_state_file(state_path, state)
+                verification = verify_resolved_plan(modpack, resolved_plan)
+                if not verification.ok:
+                    first = verification.issues[0]
+                    raise InstallError(
+                        f"Post-install verification failed for {first.mod_name}: {first.message}"
+                    )
+            except Exception as exc:
+                report.failures.append(InstallFailure("install", self._error_message(exc)))
+                if updating and report.backup_id is not None:
+                    report.rollback_attempted = True
+                    try:
+                        backup_manager.restore(report.backup_id)
+                        report.rollback_succeeded = True
+                    except Exception as rollback_exc:
+                        report.rollback_succeeded = False
+                        report.rollback_error = self._error_message(rollback_exc)
+                elif applied:
+                    try:
+                        self._rollback_adapter_apply(applied)
+                        if previous_state is None:
+                            state_path.unlink(missing_ok=True)
+                        else:
+                            atomic_write_bytes(state_path, previous_state)
+                    except OSError as rollback_exc:
+                        report.warnings.append(
+                            f"Could not fully roll back installation: {rollback_exc}"
+                        )
+                return report
+            report.installed = len(prepared)
+            if updating and report.backup_id is not None:
+                try:
+                    backup_manager.prune(DEFAULT_RETENTION)
+                except BackupError as exc:
+                    report.warnings.append(f"Could not apply backup retention: {exc}")
+            return report
+
+    @staticmethod
+    def _managed_owners(records: dict[str, Any]) -> dict[str, str]:
+        owners: dict[str, str] = {}
+        for record in records.values():
+            if not isinstance(record, dict):
+                continue
+            files = record.get("installed_files")
+            if not isinstance(files, list):
+                continue
+            for item in files:
+                if (
+                    isinstance(item, dict)
+                    and isinstance(item.get("path"), str)
+                    and isinstance(item.get("owner"), str)
+                ):
+                    owners[item["path"]] = item["owner"]
+        return owners
+
+    @staticmethod
+    def _apply_adapter_plan(
+        plan: InstallationPlan, rollback_root: Path
+    ) -> list[tuple[Path, Path | None]]:
+        """Apply validated files atomically one-by-one, restoring on any failure."""
+        rollback_root.mkdir(parents=True, exist_ok=True)
+        applied: list[tuple[Path, Path | None]] = []
+        try:
+            for index, entry in enumerate(plan.entries):
+                destination = plan.game_root.joinpath(*entry.destination.parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                previous: Path | None = None
+                if destination.exists():
+                    previous = rollback_root / str(index)
+                    destination.replace(previous)
+                applied.append((destination, previous))
+                temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+                try:
+                    shutil.copy2(entry.staged_file, temporary, follow_symlinks=False)
+                    temporary.replace(destination)
+                finally:
+                    temporary.unlink(missing_ok=True)
+        except Exception:
+            Installer._rollback_adapter_apply(applied)
+            raise
+        return applied
+
+    @staticmethod
+    def _rollback_adapter_apply(applied: list[tuple[Path, Path | None]]) -> None:
+        for destination, previous in reversed(applied):
+            destination.unlink(missing_ok=True)
+            if previous is not None and previous.exists():
+                previous.replace(destination)
 
     def _resolve_plan(
         self, modpack: Modpack, report: InstallReport

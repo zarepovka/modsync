@@ -228,4 +228,7 @@ def load_modpack(path: str | Path) -> Modpack:
         install_directory=install_directory,
         mods=mods,
         source_path=source,
+        # v0.5 treated ``game`` as descriptive text.  The normalized identifier
+        # is therefore the explicit opt-in that preserves old configurations.
+        game_adapter_id="valheim" if game == "valheim" else None,
     )

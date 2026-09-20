@@ -2,7 +2,7 @@
 
 [![Тесты](https://github.com/zarepovka/modsync/actions/workflows/tests.yml/badge.svg)](https://github.com/zarepovka/modsync/actions/workflows/tests.yml)
 
-> **Статус: v0.5.0 — Thunderstore Support**
+> **Статус: v0.6.0 — Game Adapters**
 
 ModSync — небольшой кроссплатформенный менеджер модпаков с интерфейсом командной строки. Передайте друзьям файл `modpack.json`, и ModSync скачает включённые моды, проверит их, безопасно обновит установку и сохранит локальное состояние. Профили позволяют вести несколько наборов модов с независимыми state и backup.
 
@@ -13,6 +13,9 @@ ModSync — небольшой кроссплатформенный менедж
 - Установка пакетов Thunderstore с выбором `latest` или точной версии.
 - Рекурсивное разрешение, дедупликация и установка Thunderstore-зависимостей в правильном порядке.
 - Расширяемый реестр источников: установщик не зависит от конкретного провайдера.
+- Расширяемый реестр игровых адаптеров и первая реализация для Valheim + BepInEx.
+- Полный план установки, file ownership и обнаружение конфликтов до первой записи.
+- Безопасный dry-run без изменения игры, state или backup.
 - Потоковая загрузка с отображением прогресса без помещения всего файла в память.
 - Проверка необязательной контрольной суммы SHA256 перед установкой.
 - Безопасная распаковка ZIP с защитой от обхода путей и символических ссылок.
@@ -68,6 +71,7 @@ modsync profile activate friends-server
 modsync profile list
 modsync profile info friends-server
 modsync install --profile friends-server
+modsync install --profile friends-server --dry-run
 modsync verify --profile friends-server
 modsync update --profile friends-server
 modsync info --profile friends-server
@@ -97,6 +101,69 @@ modsync backup restore modpack.json <backup-id>
 ```
 
 Команды `install` и `update` идемпотентны: если версия мода и его установленные файлы уже соответствуют модпаку, мод будет пропущен. Отсутствующие, изменённые или повреждённые моды загружаются повторно. Отключённые моды остаются нетронутыми.
+
+## Game Adapters
+
+Source Provider и Game Adapter решают разные задачи:
+
+- **Source Provider** определяет, откуда получить package: Direct URL, GitHub Releases или Thunderstore;
+- **Game Adapter** определяет, как содержимое уже скачанного package установить для конкретной игры.
+
+Новый pipeline не содержит игровых условных веток внутри installer:
+
+```text
+Modpack
+   ↓
+SourceRegistry
+   ↓
+Resolved packages
+   ↓
+GameRegistry
+   ↓
+GameAdapter
+   ↓
+InstallationPlan
+   ↓
+Backup
+   ↓
+Installer
+   ↓
+Verifier
+```
+
+Adapter-mode включается нормализованным идентификатором игры. В v0.6.0 поддерживается `"game": "valheim"`. Значения старых modpack, включая отображаемое `"Valheim"`, остаются в legacy-режиме: их `install_directory` по-прежнему означает непосредственную destination-папку. Это сохраняет совместимость с v0.5.0 без обязательной миграции.
+
+## Valheim
+
+В adapter-mode `install_directory` — корень игры, где находится `valheim.exe`, `valheim.x86_64`, `valheim.app` или `valheim_Data`, а не `BepInEx/plugins`. Автоматический поиск Steam library пока не выполняется.
+
+ValheimAdapter проверяет признаки установки игры и ожидаемую структуру `BepInEx`. BepInEx автоматически не скачивается. Если сам BepInEx присутствует в разрешённом плане как явный package/dependency, проверка не выдаёт ложную ошибку до его установки.
+
+## BepInEx Installation
+
+Поддерживаются package-пути `plugins`, `core`, `patchers`, `monomod`, `config` и эквивалентные пути с одним префиксом `BepInEx/`. Двойной путь `BepInEx/BepInEx/...` отклоняется.
+
+Для `plugins`, `core`, `patchers` и `monomod` файлы изолируются в `Author-Package` для Thunderstore или в безопасном имени мода для Direct/GitHub. `config` устанавливается без package-подкаталога в соответствии с Thunderstore override rules, поэтому конфликты конфигураций обнаруживаются явно. Файлы `*.mm.dll` направляются в `BepInEx/monomod/<owner>/`. Внутренняя структура каталогов сохраняется.
+
+Обычные runtime-файлы устанавливаются в `BepInEx/plugins/<owner>/`; промежуточные каталоги вне override-папок игнорируются согласно текущему поведению r2modman. Служебные корневые файлы `manifest.json`, `README.md`, `CHANGELOG.md` и `icon.png` в игру не копируются.
+
+Правила основаны на [официальном формате package Thunderstore](https://wiki.thunderstore.io/mods/creating-a-package), [официальной установке BepInEx](https://docs.bepinex.dev/master/articles/user_guide/installation/unity_mono.html) и актуальном [описании BepInEx packaging в r2modman](https://github.com/ebkr/r2modmanPlus/wiki/Structuring-your-Thunderstore-package). r2modman используется только как reference implementation; управление файлами, state и транзакциями остаётся архитектурой ModSync.
+
+## Dry Run
+
+```bash
+modsync install modpack.json --dry-run
+```
+
+Команда разрешает sources и dependencies, скачивает и проверяет packages, строит и полностью валидирует InstallationPlan, затем показывает destination-пути. Она не изменяет game root, не создаёт production state и не создаёт backup. Тот же флаг доступен для `update`.
+
+## File Ownership
+
+Adapter-state хранит каждый установленный destination вместе с owner и SHA256. Verifier использует эти записи напрямую и не пытается повторно угадывать routing по ZIP. Эта модель подготовлена для будущих uninstall, disable, profile switching и orphan cleanup, но сами эти операции в v0.6.0 не реализованы.
+
+## Installation Conflicts
+
+Весь план проверяется до записи первого игрового файла. Установка останавливается, если два package претендуют на один destination, если collision возникает только из-за регистра на case-insensitive платформе, либо если destination уже занят unmanaged-файлом. Замена разрешена только тому же owner; при update предыдущий файл попадает в backup.
 
 ## Профили
 
@@ -174,7 +241,7 @@ modsync backup restore modpack.json 20260916T153012Z-a4f21c
 }
 ```
 
-Готовые для редактирования примеры находятся в файлах [`examples/modpack.example.json`](examples/modpack.example.json), [`examples/modpack.github.example.json`](examples/modpack.github.example.json) и [`examples/modpack.thunderstore.example.json`](examples/modpack.thunderstore.example.json).
+Готовые для редактирования примеры находятся в файлах [`examples/modpack.example.json`](examples/modpack.example.json), [`examples/modpack.github.example.json`](examples/modpack.github.example.json), [`examples/modpack.thunderstore.example.json`](examples/modpack.thunderstore.example.json) и [`examples/modpack.valheim.example.json`](examples/modpack.valheim.example.json).
 
 ## Источники модов
 
@@ -278,7 +345,8 @@ Thunderstore-источник получает metadata пакета через 
 
 ```text
 modsync/
-├── modsync/       # CLI, профили, источники, backup, установщик и проверка
+├── modsync/       # CLI, adapters, профили, sources, backup, installer и verifier
+│   └── games/     # GameAdapter, GameRegistry и ValheimAdapter
 ├── tests/         # Модульные тесты без реальных сетевых запросов
 ├── examples/      # Пример модпака
 ├── pyproject.toml # Метаданные пакета и точка входа CLI
@@ -303,18 +371,15 @@ python -m pytest
 
 ## Планы развития
 
-- Графический интерфейс.
-- [x] Несколько игровых профилей.
-- Автоматическое определение игры.
-- [x] Резервное копирование и откат.
-- Экспорт собственных модпаков.
-- [x] Зависимости Thunderstore между модами.
-- [x] Прямые URL как источник файлов.
-- [x] GitHub Releases как источник файлов.
-- [x] Интеграция с Thunderstore.
-- Интеграция с Nexus Mods.
-- Автоматическое обновление ModSync.
-- Синхронизация модпаков между друзьями.
+- [x] Direct URL.
+- [x] GitHub Releases.
+- [x] Thunderstore и рекурсивные зависимости.
+- [x] Game Adapter architecture.
+- [x] Valheim + BepInEx.
+- [ ] Uninstall.
+- [ ] Настоящее переключение файлов между profiles.
+- [ ] Автоматическое обнаружение игры.
+- [ ] GUI.
 
 Это планы на будущее, а не возможности текущей MVP-версии.
 
@@ -326,6 +391,7 @@ python -m pytest
 - Backup создаётся автоматически для `update`; отдельной команды ручного создания пока нет.
 - Retention фиксирован на пяти последних backup и пока не настраивается.
 - ModSync не переключает автоматически настройки самой игры; active profile выбирает контекст команд ModSync.
+- Adapter-mode в v0.6.0 поддерживает только Valheim + BepInEx; автоматическая установка BepInEx выполняется только если loader является явным package/dependency.
 - Если несколько профилей указывают одинаковый `install_directory`, ModSync показывает предупреждение. Profiles share the same physical mod directory. Their ModSync state and backups remain separate, but installed files may overlap.
 - Откат использует безопасное best-effort поведение и не заявляет абсолютную транзакционность файловой системы на всех платформах.
 - Автоматическое разрешение зависимостей доступно только для Thunderstore; автоудаление orphan-зависимостей и команда предпросмотра графа пока не реализованы.

@@ -1,0 +1,19 @@
+{
+  "name": "Valheim Friends",
+  "version": "1.0.0",
+  "description": "Valheim modpack installed through the Valheim game adapter",
+  "game": "valheim",
+  "install_directory": "/path/to/Valheim",
+  "mods": [
+    {
+      "name": "ExampleMod",
+      "source": {
+        "type": "thunderstore",
+        "community": "valheim",
+        "namespace": "ExampleAuthor",
+        "package": "ExamplePackage",
+        "version": "latest"
+      }
+    }
+  ]
+}

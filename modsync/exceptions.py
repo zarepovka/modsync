@@ -45,6 +45,14 @@ class InstallError(ModSyncError):
     """Raised when a downloaded mod cannot be installed safely."""
 
 
+class GameAdapterError(InstallError):
+    """Raised when a game adapter cannot validate or plan an installation."""
+
+
+class InstallationConflictError(GameAdapterError):
+    """Raised before apply when two owners or an unmanaged file collide."""
+
+
 class ManifestError(InstallError):
     """Raised when package manifest metadata is missing or inconsistent."""
 
