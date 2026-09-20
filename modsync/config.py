@@ -177,7 +177,9 @@ def _parse_mod(value: object, index: int) -> Mod:
     )
 
 
-def load_modpack(path: str | Path) -> Modpack:
+def load_modpack(
+    path: str | Path, *, install_directory_override: Path | None = None
+) -> Modpack:
     """Read, validate, and normalize a modpack configuration."""
     source = Path(path).expanduser().resolve()
     try:
@@ -198,7 +200,15 @@ def load_modpack(path: str | Path) -> Modpack:
     name = _required_string(data, "name", "modpack")
     version = _required_string(data, "version", "modpack")
     game = _required_string(data, "game", "modpack")
-    install_value = _required_string(data, "install_directory", "modpack")
+    raw_install_value = data.get("install_directory")
+    if raw_install_value is None:
+        if install_directory_override is None:
+            raise ConfigError("modpack.install_directory must be a non-empty string")
+        install_value = None
+    elif not isinstance(raw_install_value, str) or not raw_install_value.strip():
+        raise ConfigError("modpack.install_directory must be a non-empty string")
+    else:
+        install_value = raw_install_value.strip()
     description = data.get("description", "")
     if not isinstance(description, str):
         raise ConfigError("modpack.description must be a string")
@@ -215,10 +225,15 @@ def load_modpack(path: str | Path) -> Modpack:
     if len(directories) != len(set(directories)):
         raise ConfigError("Mod names resolve to duplicate installation directories")
 
-    install_directory = Path(install_value).expanduser()
-    if not install_directory.is_absolute():
-        install_directory = source.parent / install_directory
-    install_directory = install_directory.resolve()
+    if install_value is None:
+        if install_directory_override is None:  # Defensive narrowing for type checkers.
+            raise ConfigError("A discovered installation directory is required")
+        install_directory = install_directory_override.expanduser().resolve()
+    else:
+        install_directory = Path(install_value).expanduser()
+        if not install_directory.is_absolute():
+            install_directory = source.parent / install_directory
+        install_directory = install_directory.resolve()
 
     return Modpack(
         name=name,
@@ -230,5 +245,23 @@ def load_modpack(path: str | Path) -> Modpack:
         source_path=source,
         # v0.5 treated ``game`` as descriptive text.  The normalized identifier
         # is therefore the explicit opt-in that preserves old configurations.
-        game_adapter_id="valheim" if game == "valheim" else None,
+        game_adapter_id=(
+            "valheim"
+            if game == "valheim"
+            or (install_value is None and game.strip().casefold() == "valheim")
+            else None
+        ),
     )
+
+
+def has_explicit_install_directory(path: str | Path) -> bool:
+    """Report whether a modpack declares a usable manual installation path."""
+    source = Path(path).expanduser().resolve()
+    try:
+        value = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"Cannot inspect modpack file {source}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ConfigError("The modpack root must be a JSON object")
+    install_value = value.get("install_directory")
+    return isinstance(install_value, str) and bool(install_value.strip())

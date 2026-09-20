@@ -31,6 +31,10 @@ class GameRegistry:
             raise GameAdapterError(f"Unsupported game adapter: {game}")
         return adapter
 
+    def all(self) -> tuple[GameAdapter, ...]:
+        """Return registered adapters once, preserving registration order."""
+        return tuple(dict.fromkeys(self._adapters.values()))
+
 
 def build_default_game_registry() -> GameRegistry:
     from .valheim import ValheimAdapter

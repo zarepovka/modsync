@@ -49,6 +49,22 @@ class GameAdapterError(InstallError):
     """Raised when a game adapter cannot validate or plan an installation."""
 
 
+class DiscoveryError(ModSyncError):
+    """Raised when local game discovery cannot complete safely."""
+
+
+class DiscoveryProviderError(DiscoveryError):
+    """Raised when a requested discovery provider is unavailable or unsupported."""
+
+
+class DiscoveryMetadataError(DiscoveryError):
+    """Raised when provider metadata is malformed or unsafe."""
+
+
+class DiscoverySelectionError(DiscoveryError):
+    """Raised when a discovered installation cannot be selected unambiguously."""
+
+
 class InstallationConflictError(GameAdapterError):
     """Raised before apply when two owners or an unmanaged file collide."""
 

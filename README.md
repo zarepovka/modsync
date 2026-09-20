@@ -2,7 +2,7 @@
 
 [![Тесты](https://github.com/zarepovka/modsync/actions/workflows/tests.yml/badge.svg)](https://github.com/zarepovka/modsync/actions/workflows/tests.yml)
 
-> **Статус: v0.8.0 — True Profile Switching**
+> **Статус: v0.9.0 — Automatic Game Discovery**
 
 ModSync — небольшой кроссплатформенный менеджер модпаков с интерфейсом командной строки. Передайте друзьям файл `modpack.json`, и ModSync скачает включённые моды, проверит их, безопасно обновит установку и сохранит локальное состояние. Профили позволяют вести несколько наборов модов с независимыми state и backup.
 
@@ -14,6 +14,7 @@ ModSync — небольшой кроссплатформенный менедж
 - Рекурсивное разрешение, дедупликация и установка Thunderstore-зависимостей в правильном порядке.
 - Расширяемый реестр источников: установщик не зависит от конкретного провайдера.
 - Расширяемый реестр игровых адаптеров и первая реализация для Valheim + BepInEx.
+- Read-only обнаружение Valheim в основной и дополнительных Steam libraries на Windows, macOS и Linux.
 - Полный план установки, file ownership и обнаружение конфликтов до первой записи.
 - Безопасный dry-run без изменения игры, state или backup.
 - Безопасные uninstall и временное enable/disable на основе file ownership.
@@ -69,6 +70,9 @@ python -m pip install .
 
 ```bash
 modsync profile create friends-server modpack.json
+modsync profile create friends-server modpack.json --discover
+modsync game discover valheim
+modsync profile relocate friends-server --discover
 modsync profile activate friends-server
 modsync profile switch friends-server
 modsync profile switch friends-server --dry-run
@@ -116,6 +120,7 @@ Source Provider и Game Adapter решают разные задачи:
 
 - **Source Provider** определяет, откуда получить package: Direct URL, GitHub Releases или Thunderstore;
 - **Game Adapter** определяет, как содержимое уже скачанного package установить для конкретной игры.
+- **Game Discovery Provider** ищет локальные установки через metadata лаунчера, но не решает, как устанавливать моды.
 
 Новый pipeline не содержит игровых условных веток внутри installer:
 
@@ -143,9 +148,69 @@ Adapter-mode включается нормализованным идентиф�
 
 ## Valheim
 
-В adapter-mode `install_directory` — корень игры, где находится `valheim.exe`, `valheim.x86_64`, `valheim.app` или `valheim_Data`, а не `BepInEx/plugins`. Автоматический поиск Steam library пока не выполняется.
+В adapter-mode `install_directory` — корень игры, где находится `valheim.exe`, `valheim.x86_64`, `valheim.app` или `valheim_Data`, а не `BepInEx/plugins`. Steam discovery использует App ID `892970`, а найденный путь всегда проходит через `ValheimAdapter.validate_game()`.
 
 ValheimAdapter проверяет признаки установки игры и ожидаемую структуру `BepInEx`. BepInEx автоматически не скачивается. Если сам BepInEx присутствует в разрешённом плане как явный package/dependency, проверка не выдаёт ложную ошибку до его установки.
+
+## Automatic Game Discovery
+
+```bash
+modsync game discover
+modsync game discover valheim
+modsync profile create friends-server modpack.json --discover
+```
+
+`profile create --discover` разрешает не указывать `install_directory` в `modpack.json`. Если путь всё же указан явно, он имеет приоритет: ModSync проверит его адаптером и не будет молча подменять другой установкой. Без `--discover` прежние правила и ошибки конфигурации сохраняются.
+
+Обнаружение не использует сеть, API, кэш или авторизацию. Профиль сохраняет только provider, game ID, app ID, platform и library path; Steam account и личные данные не читаются и не сохраняются.
+
+## Creating a Profile Automatically
+
+Основной workflow без ручного поиска game root:
+
+```bash
+modsync game discover
+modsync profile create friends modpack.json --discover
+modsync profile switch friends
+```
+
+## Manual Paths
+
+Явный `install_directory` по-прежнему поддерживается и всегда имеет приоритет над discovery. Невалидный явный путь даёт ошибку и не заменяется на Steam installation.
+
+## Steam
+
+Steam provider проверяет стандартные Steam roots и `libraryfolders.vdf`, затем читает только точный `appmanifest_892970.acf`. На Windows учитываются Steam registry keys и Program Files; на macOS — `~/Library/Application Support/Steam`; на Linux — native, alternate и Flatpak locations.
+
+Valve KeyValues разбирается ограниченным nested-parser, а не regex. Некорректные VDF/ACF, опасные `installdir`, traversal, control characters и неожиданный App ID дают контролируемую ошибку без traceback. Поиск не сканирует диск рекурсивно и ничего не записывает в Steam или game root.
+
+## Multiple Steam Libraries
+
+Если найдена одна валидная установка, она выбирается автоматически. При нескольких вариантах interactive TTY покажет нумерованный выбор. В CI и shell scripts выбор должен быть явным:
+
+```bash
+modsync profile create friends-server modpack.json --discover --installation 2
+modsync profile create friends-server modpack.json --discover --installation "/games/Valheim"
+```
+
+Пути канонизируются и дедуплицируются; на Windows сравнение не зависит от регистра.
+
+## Relocating a Game
+
+```bash
+modsync profile relocate friends-server --discover
+modsync profile relocate friends-server --discover --installation 1
+```
+
+Команда повторно ищет ту же игру, валидирует новый корень и меняет только binding в profile metadata. Она не перемещает и не удаляет game/mod files, не запускает install/update и не меняет state/backups. Если ранее найденный game root исчез, команды подсказывают `profile relocate <name> --discover`.
+
+### Troubleshooting
+
+- **Steam not found** — проверьте, что Steam установлен в обычном месте; запускать Steam не нужно.
+- **Game not found** — Steam найден, но `appmanifest_892970.acf` отсутствует в его libraries.
+- **Multiple installations** — повторите команду с `--installation INDEX` или точным путём.
+- **Moved Steam library** — выполните `modsync profile relocate <name> --discover`.
+- **Invalid Steam metadata** — исправьте Steam library средствами Steam; ModSync не редактирует VDF/ACF.
 
 ## BepInEx Installation
 
@@ -424,7 +489,8 @@ Thunderstore-источник получает metadata пакета через 
 ```text
 modsync/
 ├── modsync/       # CLI, adapters, профили, sources, backup, installer и verifier
-│   └── games/     # GameAdapter, GameRegistry и ValheimAdapter
+│   ├── games/     # GameAdapter, GameRegistry и ValheimAdapter
+│   └── discovery/ # DiscoveryProvider, Steam metadata и Valve KeyValues parser
 ├── tests/         # Модульные тесты без реальных сетевых запросов
 ├── examples/      # Пример модпака
 ├── pyproject.toml # Метаданные пакета и точка входа CLI
@@ -432,9 +498,11 @@ modsync/
 └── LICENSE
 ```
 
-## Безопасность
+## Security
 
 ModSync считает каждую загрузку и каждый backup недоверенными данными и никогда не запускает сохранённые файлы. Все элементы ZIP проверяются перед распаковкой: абсолютные пути, переходы в родительские директории, пути с указанием диска и символические ссылки отклоняются. При восстановлении дополнительно проверяются metadata, относительные пути, SHA256, символические и жёсткие ссылки. Ограничения на количество элементов и суммарный размер распакованных данных снижают риски, связанные с ZIP-бомбами. Установка сначала выполняется во временную директорию внутри настроенного каталога, а проверка TLS в `requests` всегда остаётся включённой.
+
+Discovery считает Steam VDF/ACF недоверенными: parser ограничен по размеру, числу токенов и глубине. Metadata может указать library, но ModSync читает в ней только ожидаемый manifest и не выполняет recursive scan. Найденные пути дедуплицируются по canonical identity и проверяются GameAdapter до сохранения в профиль.
 
 Для максимальной защиты используйте HTTPS-ссылки и указывайте `sha256`, полученный из доверенного источника. Контрольная сумма подтверждает идентичность файла, но не безопасность самого мода. Проверяйте моды и их издателей перед загрузкой в игру.
 
@@ -445,22 +513,37 @@ python -m pip install ".[dev]"
 python -m pytest
 ```
 
-Тесты проверяют конфигурации, direct/GitHub/Thunderstore sources, графы зависимостей, профили, изоляцию state и backup, locking, обратную совместимость CLI, вычисление хешей, безопасную установку ZIP, backup/restore, rollback, retention и сетевые ошибки. Реальные сетевые запросы в тестах не выполняются.
+Тесты проверяют конфигурации, direct/GitHub/Thunderstore sources, графы зависимостей, профили, discovery, Valve KeyValues, изоляцию state и backup, locking, обратную совместимость CLI, безопасную установку ZIP, backup/restore, rollback, retention и сетевые ошибки. Discovery-тесты создают только synthetic Steam trees; реальные Steam library и сетевые сервисы не используются.
 
 ## Планы развития
 
-- [x] Direct URL.
-- [x] GitHub Releases.
-- [x] Thunderstore и рекурсивные зависимости.
-- [x] Game Adapter architecture.
+- [x] Sources.
+- [x] Thunderstore.
+- [x] Game Adapters.
 - [x] Valheim + BepInEx.
-- [x] Uninstall.
-- [x] Enable / Disable.
+- [x] Uninstall / Enable / Disable.
 - [x] True Profile Switching.
-- [ ] Автоматическое обнаружение игры.
+- [x] Steam Game Discovery.
 - [ ] GUI.
 
 Это планы на будущее, а не возможности текущей MVP-версии.
+
+## Compatibility
+
+- Python 3.12, 3.13 и 3.14; CI запускается на Ubuntu, Windows и macOS.
+- Старые modpack с явным `install_directory` и все прежние CLI-команды сохраняют поведение.
+- Profile schema остаётся версии 1; installation provenance — необязательное поле, поэтому профили v0.7/v0.8 читаются без миграции.
+- Discovery работает как opt-in через `--discover`; обычное создание профиля не изменено.
+
+## Release Checklist
+
+- [x] Version set to `0.9.0`.
+- [x] GameAdapter and GameDiscoveryProvider responsibilities separated.
+- [x] Steam/Valheim discovery and relocation CLI documented.
+- [x] Synthetic discovery/security/compatibility test matrix added.
+- [x] No network, credentials, Steam cache, game files or mod files are changed by discovery.
+- [x] GitHub Actions matrix green on Ubuntu, Windows and macOS.
+- [x] Tag `v0.9.0` and GitHub Release published.
 
 ## Текущие ограничения
 
@@ -470,11 +553,11 @@ python -m pytest
 - Backup создаётся автоматически для `update`; отдельной команды ручного создания пока нет.
 - Retention фиксирован на пяти последних backup и пока не настраивается.
 - `profile activate` намеренно остаётся логическим выбором; физическое состояние меняет только `profile switch`.
-- Adapter-mode в v0.8.0 поддерживает только Valheim + BepInEx; автоматическая установка BepInEx выполняется только если loader является явным package/dependency.
+- Adapter-mode и automatic discovery в v0.9.0 поддерживают Valheim; Steam — единственный discovery provider.
 - Lifecycle-команды требуют ownership state adapter-mode; legacy installation pipeline продолжает работать, но небезопасное угадывание ownership для старых directory-only записей не выполняется.
 - Orphan dependencies только анализируются и не удаляются автоматически; команда `cleanup` зарезервирована для будущей версии.
 - Physical switch поддерживается только между профилями одной игры с одинаковым canonical game root; между разными установками используйте `profile activate`.
-- Изменённый managed runtime блокирует switch; `--force` для true switching в v0.8.0 намеренно не добавлен. При отсутствии profile artifact может потребоваться повторная загрузка по сохранённым точным source metadata.
+- Изменённый managed runtime блокирует switch; `--force` для true switching намеренно не добавлен. При отсутствии profile artifact может потребоваться повторная загрузка по сохранённым точным source metadata.
 - Откат использует безопасное best-effort поведение и не заявляет абсолютную транзакционность файловой системы на всех платформах.
 - Автоматическое разрешение зависимостей доступно только для Thunderstore; автоудаление orphan-зависимостей и команда предпросмотра графа пока не реализованы.
 - Публичный Thunderstore API не требует аутентификации; ModSync не реализует загрузку/публикацию пакетов и GUI.

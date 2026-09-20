@@ -165,9 +165,19 @@ class ProfileStore:
         self.locks_directory = self.root / "locks"
         self.config_path = self.root / "config.json"
 
-    def create(self, name: str, modpack_path: Path) -> Profile:
+    def create(
+        self,
+        name: str,
+        modpack_path: Path,
+        *,
+        install_directory: Path | None = None,
+        installation: dict[str, Any] | None = None,
+    ) -> Profile:
         name = validate_profile_name(name)
-        modpack = load_modpack(modpack_path)
+        modpack = load_modpack(
+            modpack_path, install_directory_override=install_directory
+        )
+        installation = _validate_installation_provenance(installation)
         try:
             source_bytes = modpack.source_path.read_bytes()
         except OSError as exc:
@@ -198,6 +208,8 @@ class ProfileStore:
                     "modpack_source": str(modpack.source_path),
                     "mod_count": len(modpack.mods),
                 }
+                if installation is not None:
+                    metadata["installation"] = installation
                 atomic_write_bytes(temporary / "modpack.json", source_bytes)
                 atomic_write_json(temporary / "state.json", empty_state())
                 (temporary / "backups").mkdir()
@@ -244,7 +256,10 @@ class ProfileStore:
 
     def load_modpack(self, name: str) -> Modpack:
         profile = self.get(name)
-        stored = load_modpack(profile.directory / "modpack.json")
+        stored = load_modpack(
+            profile.directory / "modpack.json",
+            install_directory_override=profile.install_directory,
+        )
         if stored.game != profile.game or len(stored.mods) != profile.mod_count:
             raise ProfileError(f"Stored modpack does not match profile metadata: {profile.name}")
         return replace(
@@ -253,6 +268,32 @@ class ProfileStore:
             state_path=profile.directory / "state.json",
             backup_directory=profile.directory / "backups",
         )
+
+    def relocate(
+        self,
+        name: str,
+        install_directory: Path,
+        installation: dict[str, Any],
+    ) -> Profile:
+        """Change only a profile's validated installation binding."""
+        name = validate_profile_name(name)
+        provenance = _validate_installation_provenance(installation)
+        if provenance is None:
+            raise ProfileError("Relocation requires installation provenance")
+        target = install_directory.expanduser().resolve()
+        with self.global_lock(), self.lock(name):
+            profile = self.get(name)
+            metadata = self._read_json(
+                profile.directory / "profile.json", "profile metadata"
+            )
+            metadata["install_directory"] = str(target)
+            metadata["installation"] = provenance
+            metadata["updated_at"] = _utc_now()
+            try:
+                atomic_write_json(profile.directory / "profile.json", metadata)
+            except OSError as exc:
+                raise ProfileError(f"Cannot relocate profile {name}: {exc}") from exc
+        return self.get(name)
 
     def active_name(self) -> str | None:
         config = self._load_config()
@@ -388,6 +429,7 @@ class ProfileStore:
         source = Path(metadata["modpack_source"]).expanduser()
         if not install_directory.is_absolute() or not source.is_absolute():
             raise ProfileError(f"Profile paths must be absolute: {name}")
+        installation = _validate_installation_provenance(metadata.get("installation"))
         for required in ("profile.json", "modpack.json", "state.json"):
             candidate = directory / required
             if candidate.is_symlink() or not candidate.is_file():
@@ -408,6 +450,7 @@ class ProfileStore:
             modpack_source=source.resolve(),
             mod_count=mod_count,
             directory=directory,
+            installation=installation,
         )
 
     def _load_config(self) -> dict[str, Any]:
@@ -444,3 +487,31 @@ class ProfileStore:
         if not isinstance(value, dict):
             raise ProfileError(f"Invalid {label}: {path}")
         return value
+
+
+def _validate_installation_provenance(
+    value: object,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ProfileError("Invalid installation provenance in profile metadata")
+    allowed = {"provider", "game_id", "app_id", "platform", "library_path"}
+    if set(value) - allowed:
+        raise ProfileError("Unsupported installation provenance fields")
+    provider = value.get("provider")
+    game_id = value.get("game_id")
+    app_id = value.get("app_id")
+    platform = value.get("platform")
+    if not all(isinstance(item, str) and item for item in (provider, game_id, platform)):
+        raise ProfileError("Invalid installation provenance in profile metadata")
+    if app_id is not None and (
+        not isinstance(app_id, (str, int)) or isinstance(app_id, bool)
+    ):
+        raise ProfileError("Invalid installation app_id in profile metadata")
+    library_path = value.get("library_path")
+    if library_path is not None and (
+        not isinstance(library_path, str) or not Path(library_path).is_absolute()
+    ):
+        raise ProfileError("Invalid installation library path in profile metadata")
+    return dict(value)

@@ -72,6 +72,21 @@ class Modpack:
 
 
 @dataclass(frozen=True, slots=True)
+class GameInstallation:
+    """One local installation reported by a read-only discovery provider."""
+
+    game_id: str
+    display_name: str
+    provider: str
+    install_path: Path
+    app_id: int | str | None
+    platform: str
+    library_path: Path | None
+    validated: bool
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class InstallationPlanEntry:
     """One prevalidated file operation produced by a game adapter."""
 
@@ -197,6 +212,7 @@ class Profile:
     modpack_source: Path
     mod_count: int
     directory: Path
+    installation: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -69,6 +69,7 @@ def _route_file(relative: PurePosixPath, owner: str) -> PurePosixPath | None:
 class ValheimAdapter(GameAdapter):
     game_id = "valheim"
     display_name = "Valheim"
+    steam_app_id = 892970
 
     def validate_game(self, game_root: Path) -> None:
         if game_root.is_symlink() or not game_root.is_dir():

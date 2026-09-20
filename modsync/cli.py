@@ -11,10 +11,12 @@ from pathlib import Path
 
 from . import __version__
 from .backup import BackupManager
-from .config import load_modpack
-from .exceptions import ModSyncError, ProfileError
+from .config import has_explicit_install_directory, load_modpack
+from .discovery import DiscoveryRegistry, build_default_discovery_registry
+from .discovery.base import canonical_path_key
+from .exceptions import DiscoveryError, DiscoverySelectionError, ModSyncError, ProfileError
 from .installer import Installer
-from .models import Mod, Modpack, Profile
+from .models import GameInstallation, Mod, Modpack, Profile
 from .profiles import ProfileStore
 from .state import (
     STATE_FILENAME,
@@ -79,12 +81,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backup_restore.add_argument("--profile", help="Use a stored profile")
 
+    game = subparsers.add_parser("game", help="Discover local game installations")
+    game_commands = game.add_subparsers(dest="game_command", required=True)
+    game_discover = game_commands.add_parser(
+        "discover", help="Discover and validate local installations"
+    )
+    game_discover.add_argument("game", nargs="?", help="Game identifier, for example valheim")
+    game_discover.add_argument("--provider", default="steam", help="Discovery provider")
+
     profile = subparsers.add_parser("profile", help="Create and manage stored profiles")
     profile_commands = profile.add_subparsers(dest="profile_command", required=True)
     profile_commands.add_parser("list", help="List profiles")
     profile_create = profile_commands.add_parser("create", help="Create a profile")
     profile_create.add_argument("name")
     profile_create.add_argument("modpack", type=Path)
+    profile_create.add_argument(
+        "--discover", action="store_true", help="Discover a missing installation path"
+    )
+    profile_create.add_argument(
+        "--installation",
+        help="Select a discovered installation by 1-based index or exact path",
+    )
     profile_info = profile_commands.add_parser("info", help="Show profile information")
     profile_info.add_argument("name")
     profile_activate = profile_commands.add_parser("activate", help="Set the active profile")
@@ -95,6 +112,15 @@ def build_parser() -> argparse.ArgumentParser:
     profile_switch.add_argument("name")
     profile_switch.add_argument(
         "--dry-run", action="store_true", help="Validate and show the transition"
+    )
+    profile_relocate = profile_commands.add_parser(
+        "relocate", help="Rebind a profile to a rediscovered game installation"
+    )
+    profile_relocate.add_argument("name")
+    profile_relocate.add_argument("--discover", action="store_true", required=True)
+    profile_relocate.add_argument(
+        "--installation",
+        help="Select a discovered installation by 1-based index or exact path",
     )
     profile_commands.add_parser("status", help="Show active and physical profile status")
     profile_delete = profile_commands.add_parser("delete", help="Delete ModSync profile data")
@@ -312,6 +338,12 @@ def _resolve_target(
             "No active profile. Use --profile NAME, activate a profile, or provide modpack.json"
         )
     profile = store.get(selected)
+    if profile.installation is not None and not profile.install_directory.is_dir():
+        raise ProfileError(
+            f"The discovered game installation is no longer available: "
+            f"{profile.install_directory}. Run 'modsync profile relocate "
+            f"{profile.name} --discover'."
+        )
     _warn_shared_install(store, profile.name)
     return _Target(store.load_modpack(profile.name), profile.name)
 
@@ -337,9 +369,96 @@ def _print_profile(profile: Profile, *, active: bool) -> None:
     print(f"Created: {profile.created_at}")
     print(f"Updated: {profile.updated_at}")
     print(f"Modpack source: {profile.modpack_source}")
+    if profile.installation is not None:
+        print(f"Installation provider: {profile.installation['provider']}")
+        if profile.installation.get("app_id") is not None:
+            print(f"Provider app ID: {profile.installation['app_id']}")
 
 
-def _run_profile_command(args: argparse.Namespace, store: ProfileStore) -> int:
+def _provenance(installation: GameInstallation) -> dict[str, object]:
+    value: dict[str, object] = {
+        "provider": installation.provider,
+        "game_id": installation.game_id,
+        "app_id": installation.app_id,
+        "platform": installation.platform,
+    }
+    if installation.library_path is not None:
+        value["library_path"] = str(installation.library_path)
+    return value
+
+
+def _print_installations(installations: Sequence[GameInstallation]) -> None:
+    print("INDEX | GAME | PROVIDER | APP ID | INSTALL PATH | STATUS")
+    for index, installation in enumerate(installations, 1):
+        status = "Valid" if installation.validated else "Invalid"
+        print(
+            f"{index} | {installation.display_name} | {installation.provider} | "
+            f"{installation.app_id or '-'} | {installation.install_path} | {status}"
+        )
+
+
+def _discover_installations(
+    registry: DiscoveryRegistry, game: str, provider: str = "steam"
+) -> list[GameInstallation]:
+    results = registry.discover(game, provider=provider)
+    if not results:
+        selected_provider = registry.get(provider)
+        if provider.casefold() == "steam" and not getattr(selected_provider, "steam_found", True):
+            raise DiscoveryError("Steam was not found.")
+        display_name = registry.games.get(game).display_name
+        raise DiscoveryError(f"Steam was found, but {display_name} is not installed.")
+    return results
+
+
+def _select_installation(
+    installations: Sequence[GameInstallation], selection: str | None
+) -> GameInstallation:
+    valid = [installation for installation in installations if installation.validated]
+    if not valid:
+        details = next(
+            (
+                str(item.metadata["validation_error"])
+                for item in installations
+                if item.metadata.get("validation_error")
+            ),
+            "no candidate passed game validation",
+        )
+        raise DiscoverySelectionError(f"No valid discovered installation: {details}")
+    if selection is not None:
+        try:
+            index = int(selection)
+        except ValueError:
+            selected_path = Path(selection).expanduser().resolve(strict=False)
+            matches = [
+                item
+                for item in valid
+                if canonical_path_key(selected_path, item.platform)
+                == canonical_path_key(item.install_path, item.platform)
+            ]
+            if len(matches) != 1:
+                raise DiscoverySelectionError(
+                    f"No discovered installation matches path: {selection}"
+                )
+            return matches[0]
+        if index < 1 or index > len(installations) or not installations[index - 1].validated:
+            raise DiscoverySelectionError("Selected installation index is not valid")
+        return installations[index - 1]
+    if len(valid) == 1:
+        return valid[0]
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        _print_installations(installations)
+        raise DiscoverySelectionError(
+            f"Multiple {valid[0].display_name} installations were found. "
+            "Select one explicitly with --installation INDEX or an exact path."
+        )
+    _print_installations(installations)
+    answer = input("Select installation number: ").strip()
+    return _select_installation(installations, answer)
+
+
+def _run_profile_command(
+    args: argparse.Namespace, store: ProfileStore, discovery: DiscoveryRegistry
+) -> int:
     if args.profile_command == "list":
         profiles = store.list()
         active = store.active_name()
@@ -352,7 +471,27 @@ def _run_profile_command(args: argparse.Namespace, store: ProfileStore) -> int:
             print(f"{profile.name} | {profile.game} | {profile.mod_count} | {marker}")
         return 0
     if args.profile_command == "create":
-        profile = store.create(args.name, args.modpack)
+        if args.installation is not None and not args.discover:
+            raise ProfileError("--installation requires --discover")
+        installation = None
+        install_directory = None
+        if args.discover:
+            probe = load_modpack(
+                args.modpack, install_directory_override=Path.cwd().resolve()
+            )
+            if has_explicit_install_directory(args.modpack):
+                discovery.games.get(probe.game).validate_game(probe.install_directory)
+                print("Using explicit install_directory; automatic discovery was not needed.")
+            else:
+                candidates = _discover_installations(discovery, probe.game)
+                installation = _select_installation(candidates, args.installation)
+                install_directory = installation.install_path
+        profile = store.create(
+            args.name,
+            args.modpack,
+            install_directory=install_directory,
+            installation=_provenance(installation) if installation is not None else None,
+        )
         print(f"Profile created: {profile.name}")
         _warn_shared_install(store, profile.name)
         print(f"Activate it: modsync profile activate {profile.name}")
@@ -368,6 +507,16 @@ def _run_profile_command(args: argparse.Namespace, store: ProfileStore) -> int:
         print("Physical game files were not changed. Use 'profile switch' to reconcile them.")
         return 0
     if args.profile_command == "switch":
+        selected_profile = store.get(args.name)
+        if (
+            selected_profile.installation is not None
+            and not selected_profile.install_directory.is_dir()
+        ):
+            raise ProfileError(
+                f"The discovered game installation is no longer available: "
+                f"{selected_profile.install_directory}. Run 'modsync profile relocate "
+                f"{selected_profile.name} --discover'."
+            )
         report = ProfileSwitcher(store).switch(args.name, dry_run=args.dry_run)
         print(f"Switch: {report.source_profile} -> {report.target_profile}")
         print(f"Keep: {report.kept} files")
@@ -385,6 +534,19 @@ def _run_profile_command(args: argparse.Namespace, store: ProfileStore) -> int:
             print(f"Active profile: {report.target_profile}")
             if report.backup_id:
                 print(f"Backup created: {report.backup_id}")
+        return 0
+    if args.profile_command == "relocate":
+        profile = store.get(args.name)
+        candidates = _discover_installations(discovery, profile.game)
+        installation = _select_installation(candidates, args.installation)
+        if discovery.games.get(profile.game).game_id != installation.game_id:
+            raise DiscoverySelectionError("Discovered installation is for a different game")
+        relocated = store.relocate(
+            profile.name, installation.install_path, _provenance(installation)
+        )
+        print(f"Profile relocated: {relocated.name}")
+        print(f"Install directory: {relocated.install_directory}")
+        print("No game or mod files were moved or changed.")
         return 0
     if args.profile_command == "status":
         active = store.active_name()
@@ -420,14 +582,32 @@ def _run_profile_command(args: argparse.Namespace, store: ProfileStore) -> int:
 
 
 def main(
-    argv: Sequence[str] | None = None, *, profile_store: ProfileStore | None = None
+    argv: Sequence[str] | None = None,
+    *,
+    profile_store: ProfileStore | None = None,
+    discovery_registry: DiscoveryRegistry | None = None,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     store = profile_store or ProfileStore()
+    discovery = discovery_registry or build_default_discovery_registry()
     try:
         if args.command == "profile":
-            return _run_profile_command(args, store)
+            return _run_profile_command(args, store, discovery)
+        if args.command == "game":
+            installations = discovery.discover(args.game, provider=args.provider)
+            if not installations:
+                selected_provider = discovery.get(args.provider)
+                if args.provider.casefold() == "steam" and not getattr(
+                    selected_provider, "steam_found", True
+                ):
+                    raise DiscoveryError("Steam was not found.")
+                if args.game is None:
+                    raise DiscoveryError("Steam was found, but no supported games are installed.")
+                game_name = discovery.games.get(args.game).display_name
+                raise DiscoveryError(f"Steam was found, but {game_name} is not installed.")
+            _print_installations(installations)
+            return 0
 
         if args.command == "backup" and args.backup_command == "restore":
             if args.profile is not None:
