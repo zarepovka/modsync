@@ -1,0 +1,21 @@
+{
+  "name": "Valheim Thunderstore Example",
+  "version": "1.0.0",
+  "description": "Пример модпака Thunderstore; замените install_directory на папку модов игры",
+  "game": "Valheim",
+  "install_directory": "./mods",
+  "mods": [
+    {
+      "name": "BepInExPack Valheim",
+      "source": {
+        "type": "thunderstore",
+        "community": "valheim",
+        "namespace": "denikson",
+        "package": "BepInExPack_Valheim",
+        "version": "latest"
+      },
+      "sha256": null,
+      "enabled": true
+    }
+  ]
+}

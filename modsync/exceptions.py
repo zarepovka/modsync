@@ -29,8 +29,24 @@ class SourceRateLimitError(SourceError):
     """Raised when the source service rejects a request due to rate limits."""
 
 
+class DependencyError(SourceError):
+    """Raised when a package dependency graph is invalid."""
+
+
+class DependencyConflictError(DependencyError):
+    """Raised when one package is required at incompatible versions."""
+
+
+class DependencyCycleError(DependencyError):
+    """Raised when a dependency graph contains a cycle."""
+
+
 class InstallError(ModSyncError):
     """Raised when a downloaded mod cannot be installed safely."""
+
+
+class ManifestError(InstallError):
+    """Raised when package manifest metadata is missing or inconsistent."""
 
 
 class StateError(ModSyncError):

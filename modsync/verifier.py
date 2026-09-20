@@ -7,7 +7,14 @@ from typing import Any
 
 from .config import mod_directory_name
 from .hashing import sha256_file
-from .models import Mod, Modpack, ResolvedMod, VerificationIssue, VerificationReport
+from .models import (
+    Mod,
+    Modpack,
+    ResolvedMod,
+    ResolvedPlanItem,
+    VerificationIssue,
+    VerificationReport,
+)
 from .state import STATE_FILENAME, load_state_file
 
 
@@ -92,4 +99,42 @@ def verify_modpack(
             modpack.install_directory, mod, records.get(mod.name), resolved=resolved
         ):
             issues.append(VerificationIssue(mod_name=mod.name, message=message))
+    explicit_names = {mod.name.casefold() for mod in modpack.mods}
+    for name, record in records.items():
+        if (
+            not isinstance(name, str)
+            or name.casefold() in explicit_names
+            or not isinstance(record, dict)
+            or record.get("role") != "dependency"
+        ):
+            continue
+        version = record.get("version")
+        dependency = Mod(
+            name=name,
+            version=version if isinstance(version, str) else None,
+            url=None,
+        )
+        checked += 1
+        for message in verify_mod_record(
+            modpack.install_directory, dependency, record
+        ):
+            issues.append(VerificationIssue(mod_name=name, message=message))
     return VerificationReport(checked=checked, issues=tuple(issues))
+
+
+def verify_resolved_plan(
+    modpack: Modpack, plan: list[ResolvedPlanItem]
+) -> VerificationReport:
+    """Verify every explicit and dependency entry in a resolved install plan."""
+    state_path = modpack.state_path or modpack.install_directory / STATE_FILENAME
+    records: dict[str, Any] = load_state_file(state_path)["mods"]
+    issues: list[VerificationIssue] = []
+    for item in plan:
+        for message in verify_mod_record(
+            modpack.install_directory,
+            item.mod,
+            records.get(item.mod.name),
+            resolved=item.resolved,
+        ):
+            issues.append(VerificationIssue(mod_name=item.mod.name, message=message))
+    return VerificationReport(checked=len(plan), issues=tuple(issues))

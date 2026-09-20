@@ -12,6 +12,12 @@ from .exceptions import ConfigError
 from .models import Mod, Modpack, SourceSpec
 
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_THUNDERSTORE_COMMUNITY_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,254}[a-z0-9])?$")
+_THUNDERSTORE_NAMESPACE_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_]{0,62}[A-Za-z0-9])?$")
+_THUNDERSTORE_PACKAGE_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_]{0,126}[A-Za-z0-9])?$")
+_THUNDERSTORE_VERSION_RE = re.compile(
+    r"^(?:latest|(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))$"
+)
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _WINDOWS_RESERVED = {
     "CON",
@@ -107,6 +113,40 @@ def _parse_mod(value: object, index: int) -> Mod:
                     "asset": _required_string(source_value, "asset", f"{context}.source"),
                 },
             )
+            url = None
+        elif source_type == "thunderstore":
+            allowed = {"type", "community", "namespace", "package", "version"}
+            unexpected = set(source_value) - allowed
+            if unexpected:
+                raise ConfigError(
+                    f"{context}.source contains unsupported fields: {', '.join(sorted(unexpected))}"
+                )
+            community = _required_string(source_value, "community", f"{context}.source")
+            namespace = _required_string(source_value, "namespace", f"{context}.source")
+            package = _required_string(source_value, "package", f"{context}.source")
+            requested_version = _required_string(
+                source_value, "version", f"{context}.source"
+            )
+            if not _THUNDERSTORE_COMMUNITY_RE.fullmatch(community):
+                raise ConfigError(f"{context}.source.community is not a safe identifier")
+            if not _THUNDERSTORE_NAMESPACE_RE.fullmatch(namespace):
+                raise ConfigError(f"{context}.source.namespace is not a valid Thunderstore name")
+            if not _THUNDERSTORE_PACKAGE_RE.fullmatch(package):
+                raise ConfigError(f"{context}.source.package is not a valid Thunderstore name")
+            if not _THUNDERSTORE_VERSION_RE.fullmatch(requested_version):
+                raise ConfigError(
+                    f"{context}.source.version must be latest or Major.Minor.Patch"
+                )
+            source = SourceSpec(
+                type="thunderstore",
+                options={
+                    "community": community,
+                    "namespace": namespace,
+                    "package": package,
+                    "version": requested_version,
+                },
+            )
+            version = None if requested_version == "latest" else requested_version
             url = None
         else:
             raise ConfigError(f"{context}.source.type is unsupported: {source_type}")

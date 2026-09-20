@@ -2,7 +2,7 @@
 
 [![Тесты](https://github.com/zarepovka/modsync/actions/workflows/tests.yml/badge.svg)](https://github.com/zarepovka/modsync/actions/workflows/tests.yml)
 
-> **Статус: v0.4.0 — Sources & GitHub Releases**
+> **Статус: v0.5.0 — Thunderstore Support**
 
 ModSync — небольшой кроссплатформенный менеджер модпаков с интерфейсом командной строки. Передайте друзьям файл `modpack.json`, и ModSync скачает включённые моды, проверит их, безопасно обновит установку и сохранит локальное состояние. Профили позволяют вести несколько наборов модов с независимыми state и backup.
 
@@ -10,6 +10,8 @@ ModSync — небольшой кроссплатформенный менедж
 
 - Установка ZIP-архивов и обычных файлов по HTTP(S)-ссылкам.
 - Получение опубликованных стабильных релизов и assets через официальный GitHub API.
+- Установка пакетов Thunderstore с выбором `latest` или точной версии.
+- Рекурсивное разрешение, дедупликация и установка Thunderstore-зависимостей в правильном порядке.
 - Расширяемый реестр источников: установщик не зависит от конкретного провайдера.
 - Потоковая загрузка с отображением прогресса без помещения всего файла в память.
 - Проверка необязательной контрольной суммы SHA256 перед установкой.
@@ -21,7 +23,7 @@ ModSync — небольшой кроссплатформенный менедж
 - Несколько профилей с независимыми modpack, state и backup.
 - Активный профиль для коротких команд без `--profile`.
 - Кроссплатформенная блокировка изменяющих операций одного профиля.
-- Продолжение обработки модпака, даже если один из файлов не удалось скачать.
+- Понятные сообщения об ошибках без traceback для обычного пользователя.
 
 ## Требования
 
@@ -172,9 +174,9 @@ modsync backup restore modpack.json 20260916T153012Z-a4f21c
 }
 ```
 
-Готовые для редактирования примеры находятся в файлах [`examples/modpack.example.json`](examples/modpack.example.json) и [`examples/modpack.github.example.json`](examples/modpack.github.example.json).
+Готовые для редактирования примеры находятся в файлах [`examples/modpack.example.json`](examples/modpack.example.json), [`examples/modpack.github.example.json`](examples/modpack.github.example.json) и [`examples/modpack.thunderstore.example.json`](examples/modpack.thunderstore.example.json).
 
-## Mod Sources
+## Источники модов
 
 Каждый мод может описывать источник в объекте `source`. Старый формат с полями `version` и `url` остаётся полностью совместимым и не требует миграции.
 
@@ -235,6 +237,43 @@ modsync update modpack.json
 - `asset not found` — проверьте имя файла или glob-шаблон;
 - `ambiguous assets` — уточните шаблон так, чтобы он совпадал ровно с одним asset.
 
+### Thunderstore
+
+Thunderstore-источник получает metadata пакета через публичный read-only API, проверяет выбранное community и скачивает официальный ZIP-архив. Ключ API не требуется.
+
+```json
+{
+  "name": "BepInExPack Valheim",
+  "source": {
+    "type": "thunderstore",
+    "community": "valheim",
+    "namespace": "denikson",
+    "package": "BepInExPack_Valheim",
+    "version": "latest"
+  }
+}
+```
+
+Поле `version` принимает:
+
+- `latest` — при каждой команде `install` или `update` разрешается актуальная версия;
+- точную версию вида `1.2.3` — ModSync не заменяет её более новой.
+
+Перед любым изменением установки ModSync рекурсивно строит весь граф зависимостей. Каждая зависимость Thunderstore содержит точную версию. Одинаковые пакеты скачиваются один раз, зависимости устанавливаются раньше зависящего пакета, а конфликты версий и циклы останавливают операцию до скачивания. Сначала скачиваются и проверяются все ZIP-файлы и `manifest.json`, и только затем начинается установка.
+
+Для `latest` пакета и его зависимостей обновляются вместе. Если зависимость больше не нужна, она остаётся как orphan: ModSync не удаляе её автоматически. Для устаревшего (`deprecated`) пакета с `latest` выводится предупреждение, но замена не выбирается автоматически.
+
+Команда `modsync info` показывает источник, установленную версию и статус `latest`, `pinned` или `dependency`.
+
+Типичные ошибки:
+
+- `package ... was not found` — проверьте `namespace` и `package`;
+- `community ... was not found` — пакет не опубликован для указанного community;
+- `Dependency conflict` — два пакета требуют разные точные версии одной зависимости;
+- `Circular dependency` — в metadata найден цикл;
+- `manifest ... mismatch` — скачанный `manifest.json` не совпадает с metadata API;
+- `rate limit` или `Could not query Thunderstore` — сервис временно недоступен; повторите команду позже.
+
 ## Структура проекта
 
 ```text
@@ -260,7 +299,7 @@ python -m pip install ".[dev]"
 python -m pytest
 ```
 
-Тесты проверяют конфигурации, direct/GitHub sources, профили, активный профиль, изоляцию state и backup, locking, обратную совместимость CLI, вычисление хешей, безопасную установку ZIP, backup/restore, rollback, retention и сетевые ошибки. Реальные сетевые запросы в тестах не выполняются.
+Тесты проверяют конфигурации, direct/GitHub/Thunderstore sources, графы зависимостей, профили, изоляцию state и backup, locking, обратную совместимость CLI, вычисление хешей, безопасную установку ZIP, backup/restore, rollback, retention и сетевые ошибки. Реальные сетевые запросы в тестах не выполняются.
 
 ## Планы развития
 
@@ -269,10 +308,10 @@ python -m pytest
 - Автоматическое определение игры.
 - [x] Резервное копирование и откат.
 - Экспорт собственных модпаков.
-- Зависимости между модами.
+- [x] Зависимости Thunderstore между модами.
 - [x] Прямые URL как источник файлов.
 - [x] GitHub Releases как источник файлов.
-- Интеграция с Thunderstore.
+- [x] Интеграция с Thunderstore.
 - Интеграция с Nexus Mods.
 - Автоматическое обновление ModSync.
 - Синхронизация модпаков между друзьями.
@@ -281,7 +320,7 @@ python -m pytest
 
 ## Текущие ограничения
 
-- Поддерживаются direct URL и GitHub Releases; Thunderstore, Nexus Mods и локальные/custom providers пока не реализованы.
+- Поддерживаются direct URL, GitHub Releases и Thunderstore; Nexus Mods и локальные/custom providers пока не реализованы.
 - Для проверки установленных версий необходимо сохранить локальный файл состояния.
 - Отключённые или удалённые из модпака моды не удаляются автоматически.
 - Backup создаётся автоматически для `update`; отдельной команды ручного создания пока нет.
@@ -289,7 +328,8 @@ python -m pytest
 - ModSync не переключает автоматически настройки самой игры; active profile выбирает контекст команд ModSync.
 - Если несколько профилей указывают одинаковый `install_directory`, ModSync показывает предупреждение. Profiles share the same physical mod directory. Their ModSync state and backups remain separate, but installed files may overlap.
 - Откат использует безопасное best-effort поведение и не заявляет абсолютную транзакционность файловой системы на всех платформах.
-- Пока нет разрешения зависимостей, аутентификации и GUI.
+- Автоматическое разрешение зависимостей доступно только для Thunderstore; автоудаление orphan-зависимостей и команда предпросмотра графа пока не реализованы.
+- Публичный Thunderstore API не требует аутентификации; ModSync не реализует загрузку/публикацию пакетов и GUI.
 - ModSync не определяет, является ли скачанный мод безопасным и совместимым с игрой.
 
 ## Лицензия

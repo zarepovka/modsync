@@ -149,14 +149,35 @@ def _run_info(modpack: Modpack) -> int:
     if modpack.description:
         print(f"Description: {modpack.description}")
     print(f"Install directory: {modpack.install_directory}")
-    print(f"Mods: {len(modpack.mods)}")
+    explicit_names = {mod.name.casefold() for mod in modpack.mods}
+    dependency_records = {
+        name: record
+        for name, record in records.items()
+        if isinstance(name, str)
+        and name.casefold() not in explicit_names
+        and isinstance(record, dict)
+        and record.get("role") == "dependency"
+    }
+    print(
+        f"Mods: {len(modpack.mods)} configured, "
+        f"{len(dependency_records)} dependencies recorded"
+    )
+    print("NAME | SOURCE | VERSION | STATUS")
     for mod in modpack.mods:
-        status = "enabled" if mod.enabled else "disabled"
         source_type = mod.source.type if mod.source is not None else "direct"
         record = records.get(mod.name)
         resolved_version = record.get("version") if isinstance(record, dict) else None
         version = resolved_version or mod.version or "not resolved"
-        print(f"  - {mod.name} {version} [{status}; source: {source_type}]")
+        options = mod.source.options if mod.source is not None else {}
+        selector = options.get("version") or options.get("release")
+        policy = "latest" if selector == "latest" else "pinned"
+        status = policy if mod.enabled else f"disabled/{policy}"
+        print(f"{mod.name} | source: {source_type} | {version} | {status}")
+    for name, record in sorted(dependency_records.items(), key=lambda item: item[0].casefold()):
+        source = record.get("source")
+        source_type = source.get("type") if isinstance(source, dict) else "unknown"
+        version = record.get("version") or "unknown"
+        print(f"{name} | source: {source_type} | {version} | dependency")
     return 0
 
 

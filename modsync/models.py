@@ -40,6 +40,19 @@ class ResolvedMod:
     release_metadata: dict[str, Any]
     source_identity: dict[str, Any]
     request_headers: dict[str, str] = field(default_factory=dict, repr=False)
+    dependencies: tuple["ResolvedMod", ...] = ()
+    warnings: tuple[str, ...] = ()
+    provider_key: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedPlanItem:
+    """One provider-neutral installation-plan entry."""
+
+    mod: Mod
+    resolved: ResolvedMod
+    explicit: bool
+    required_by: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

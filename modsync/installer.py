@@ -16,10 +16,17 @@ from .config import mod_directory_name
 from .downloader import Downloader
 from .exceptions import BackupError, InstallError, ModSyncError
 from .hashing import sha256_file
-from .models import InstallFailure, InstallReport, Mod, Modpack, ResolvedMod
+from .models import (
+    InstallFailure,
+    InstallReport,
+    Mod,
+    Modpack,
+    ResolvedMod,
+    ResolvedPlanItem,
+)
 from .sources import SourceRegistry, build_default_registry
 from .state import STATE_FILENAME, load_state_file, save_state_file
-from .verifier import verify_mod_record, verify_modpack
+from .verifier import verify_mod_record, verify_resolved_plan
 
 MAX_ZIP_FILES = 20_000
 MAX_ZIP_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
@@ -119,34 +126,50 @@ class Installer:
         state_path = modpack.state_path or root / STATE_FILENAME
         state = load_state_file(state_path)
         records: dict[str, Any] = state["mods"]
-        report = InstallReport()
-
-        for mod in modpack.mods:
-            if not mod.enabled:
+        report = InstallReport(
+            skipped=sum(1 for mod in modpack.mods if not mod.enabled)
+        )
+        plan = self._resolve_plan(modpack, report)
+        if plan is None:
+            return report
+        self._collect_warnings(plan, report)
+        changed: list[ResolvedPlanItem] = []
+        for item in plan:
+            existing = records.get(item.mod.name)
+            if existing is not None and not verify_mod_record(
+                root, item.mod, existing, resolved=item.resolved
+            ):
                 report.skipped += 1
-                continue
+            else:
+                changed.append(item)
+        if not changed:
+            return report
+
+        with tempfile.TemporaryDirectory(prefix=".modsync-install-", dir=root) as name:
+            transaction = Path(name)
+            prepared_mods = self._prepare_plan(transaction, changed, progress, report)
+            if prepared_mods is None:
+                return report
             try:
-                resolved = self.source_registry.resolve(mod)
-                existing = records.get(mod.name)
-                if existing is not None and not verify_mod_record(
-                    root, mod, existing, resolved=resolved
-                ):
-                    report.skipped += 1
-                    continue
-                with tempfile.TemporaryDirectory(prefix=".modsync-", dir=root) as name:
-                    workspace = Path(name)
-                    prepared = self.prepare_mod(workspace, mod, resolved, progress)
-                    self.apply_prepared_mod(root, prepared, workspace / "previous")
-                records[mod.name] = prepared.state_record
+                displaced = transaction / "displaced"
+                for prepared in prepared_mods:
+                    self.apply_prepared_mod(root, prepared, displaced)
+                    records[prepared.mod.name] = prepared.state_record
                 state["modpack"] = {"name": modpack.name, "version": modpack.version}
                 save_state_file(state_path, state)
-                report.installed += 1
-            except ModSyncError as exc:
-                report.failures.append(InstallFailure(mod_name=mod.name, message=str(exc)))
-            except OSError as exc:
+                verification = verify_resolved_plan(modpack, plan)
+                if not verification.ok:
+                    first = verification.issues[0]
+                    raise InstallError(
+                        f"Post-install verification failed for {first.mod_name}: "
+                        f"{first.message}"
+                    )
+            except (ModSyncError, OSError) as exc:
                 report.failures.append(
-                    InstallFailure(mod_name=mod.name, message=f"Filesystem error: {exc}")
+                    InstallFailure(mod_name="install", message=self._error_message(exc))
                 )
+                return report
+        report.installed = len(prepared_mods)
         return report
 
     def update_modpack(
@@ -160,50 +183,36 @@ class Installer:
         state_path = modpack.state_path or root / STATE_FILENAME
         state = load_state_file(state_path)
         records: dict[str, Any] = state["mods"]
-        report = InstallReport()
-        changed: list[tuple[Mod, ResolvedMod]] = []
+        report = InstallReport(
+            skipped=sum(1 for mod in modpack.mods if not mod.enabled)
+        )
+        plan = self._resolve_plan(modpack, report)
+        if plan is None:
+            return report
+        self._collect_warnings(plan, report)
+        changed: list[ResolvedPlanItem] = []
 
-        for mod in modpack.mods:
-            if not mod.enabled:
-                report.skipped += 1
-                continue
-            try:
-                resolved = self.source_registry.resolve(mod)
-            except (ModSyncError, OSError) as exc:
-                report.failures.append(
-                    InstallFailure(mod_name=mod.name, message=self._error_message(exc))
-                )
-                return report
-            existing = records.get(mod.name)
+        for item in plan:
+            existing = records.get(item.mod.name)
             if existing is not None and not verify_mod_record(
-                root, mod, existing, resolved=resolved
+                root, item.mod, existing, resolved=item.resolved
             ):
                 report.skipped += 1
             else:
-                changed.append((mod, resolved))
+                changed.append(item)
         if not changed:
             return report
 
         with tempfile.TemporaryDirectory(prefix=".modsync-update-", dir=root) as name:
             transaction = Path(name)
-            prepared_mods: list[PreparedMod] = []
-            for mod, resolved in changed:
-                try:
-                    prepared_mods.append(
-                        self.prepare_mod(
-                            transaction / mod_directory_name(mod.name), mod, resolved, progress
-                        )
-                    )
-                except (ModSyncError, OSError) as exc:
-                    report.failures.append(
-                        InstallFailure(mod_name=mod.name, message=self._error_message(exc))
-                    )
-                    return report
+            prepared_mods = self._prepare_plan(transaction, changed, progress, report)
+            if prepared_mods is None:
+                return report
 
             backup_manager = self.backup_manager_factory(modpack)
             try:
                 backup = backup_manager.create(
-                    [mod for mod, _resolved in changed], state, reason="update"
+                    [item.mod for item in changed], state, reason="update"
                 )
                 report.backup_id = backup.backup_id
             except (BackupError, OSError) as exc:
@@ -223,10 +232,7 @@ class Installer:
                 current_mod = "state"
                 save_state_file(state_path, state)
                 current_mod = "verification"
-                verification = verify_modpack(
-                    modpack,
-                    resolved_by_name={item.resolved.name: item.resolved for item in prepared_mods},
-                )
+                verification = verify_resolved_plan(modpack, plan)
                 if not verification.ok:
                     first = verification.issues[0]
                     raise InstallError(
@@ -279,6 +285,7 @@ class Installer:
             safe_extract_zip(artifact, staged)
         else:
             shutil.copy2(artifact, staged / artifact.name)
+        self.source_registry.validate_staged(resolved, staged)
 
         files = _file_manifest(staged)
         if not files:
@@ -296,10 +303,62 @@ class Installer:
                     "release": resolved.release_metadata,
                     "sha256": artifact_digest,
                 },
+                "role": "explicit",
+                "required_by": [],
                 "directory": mod_directory_name(mod.name),
                 "files": files,
             },
         )
+
+    def _resolve_plan(
+        self, modpack: Modpack, report: InstallReport
+    ) -> list[ResolvedPlanItem] | None:
+        try:
+            return self.source_registry.resolve_plan(modpack.mods)
+        except (ModSyncError, OSError) as exc:
+            report.failures.append(
+                InstallFailure(mod_name="resolution", message=self._error_message(exc))
+            )
+            return None
+
+    def _prepare_plan(
+        self,
+        transaction: Path,
+        plan: list[ResolvedPlanItem],
+        progress: InstallProgressCallback | None,
+        report: InstallReport,
+    ) -> list[PreparedMod] | None:
+        prepared_mods: list[PreparedMod] = []
+        for item in plan:
+            try:
+                prepared = self.prepare_mod(
+                    transaction / mod_directory_name(item.mod.name),
+                    item.mod,
+                    item.resolved,
+                    progress,
+                )
+                prepared.state_record["role"] = (
+                    "explicit" if item.explicit else "dependency"
+                )
+                prepared.state_record["required_by"] = list(item.required_by)
+                prepared_mods.append(prepared)
+            except (ModSyncError, OSError) as exc:
+                report.failures.append(
+                    InstallFailure(
+                        mod_name=item.mod.name, message=self._error_message(exc)
+                    )
+                )
+                return None
+        return prepared_mods
+
+    @staticmethod
+    def _collect_warnings(
+        plan: list[ResolvedPlanItem], report: InstallReport
+    ) -> None:
+        for item in plan:
+            for warning in item.resolved.warnings:
+                if warning not in report.warnings:
+                    report.warnings.append(warning)
 
     def apply_prepared_mod(
         self,
