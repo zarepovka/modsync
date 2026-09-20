@@ -99,3 +99,11 @@ class ProfileExistsError(ProfileError):
 
 class ProfileLockError(ProfileError):
     """Raised when a modifying operation cannot acquire a profile lock."""
+
+
+class ProfileSwitchError(ProfileError):
+    """Raised when a physical profile transition cannot be completed safely."""
+
+
+class SwitchConflictError(ProfileSwitchError):
+    """Raised when current files conflict with a validated SwitchPlan."""

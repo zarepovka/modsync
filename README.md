@@ -2,7 +2,7 @@
 
 [![Тесты](https://github.com/zarepovka/modsync/actions/workflows/tests.yml/badge.svg)](https://github.com/zarepovka/modsync/actions/workflows/tests.yml)
 
-> **Статус: v0.7.0 — Uninstall & Enable/Disable**
+> **Статус: v0.8.0 — True Profile Switching**
 
 ModSync — небольшой кроссплатформенный менеджер модпаков с интерфейсом командной строки. Передайте друзьям файл `modpack.json`, и ModSync скачает включённые моды, проверит их, безопасно обновит установку и сохранит локальное состояние. Профили позволяют вести несколько наборов модов с независимыми state и backup.
 
@@ -17,6 +17,7 @@ ModSync — небольшой кроссплатформенный менедж
 - Полный план установки, file ownership и обнаружение конфликтов до первой записи.
 - Безопасный dry-run без изменения игры, state или backup.
 - Безопасные uninstall и временное enable/disable на основе file ownership.
+- Транзакционное физическое переключение общего game root между профилями.
 - Потоковая загрузка с отображением прогресса без помещения всего файла в память.
 - Проверка необязательной контрольной суммы SHA256 перед установкой.
 - Безопасная распаковка ZIP с защитой от обхода путей и символических ссылок.
@@ -26,7 +27,7 @@ ModSync — небольшой кроссплатформенный менедж
 - Проверка целостности backup и ручное восстановление предыдущего состояния.
 - Несколько профилей с независимыми modpack, state и backup.
 - Активный профиль для коротких команд без `--profile`.
-- Кроссплатформенная блокировка изменяющих операций одного профиля.
+- Кроссплатформенные profile- и game-root locks для изменяющих операций.
 - Понятные сообщения об ошибках без traceback для обычного пользователя.
 
 ## Требования
@@ -69,6 +70,9 @@ python -m pip install .
 ```bash
 modsync profile create friends-server modpack.json
 modsync profile activate friends-server
+modsync profile switch friends-server
+modsync profile switch friends-server --dry-run
+modsync profile status
 modsync profile list
 modsync profile info friends-server
 modsync install --profile friends-server
@@ -163,7 +167,7 @@ modsync install modpack.json --dry-run
 
 ## File Ownership
 
-Adapter-state хранит каждый установленный destination вместе с owner и SHA256. Verifier использует эти записи напрямую и не пытается повторно угадывать routing по ZIP. Эта модель подготовлена для будущих uninstall, disable, profile switching и orphan cleanup, но сами эти операции в v0.6.0 не реализованы.
+Adapter-state хранит каждый установленный destination вместе с owner и SHA256. Verifier и lifecycle/profile-switch operations используют эти записи напрямую и не пытаются повторно угадывать routing по ZIP.
 
 ## Installation Conflicts
 
@@ -204,9 +208,36 @@ Config-файлы в `BepInEx/config` не перемещаются при disab
 
 ## Orphan Dependencies
 
-После удаления explicit-мода ModSync анализирует оставшиеся dependency records. Больше не используемые dependencies не удаляются автоматически, а выводятся как потенциальные orphan packages. Автоматический `cleanup` в v0.7.0 намеренно не реализован.
+После удаления explicit-мода ModSync анализирует оставшиеся dependency records. Больше не используемые dependencies не удаляются автоматически, а выводятся как потенциальные orphan packages. Автоматический `cleanup` в v0.8.0 намеренно не реализован.
 
 Для всех трёх операций доступен `--dry-run`: он строит и проверяет план, но не меняет game root, disabled storage, state или backups. Реальные операции используют общий BackupManager schema v3 для game и disabled roots; при ошибке тот же rollback engine восстанавливает файлы и state.
+
+## True Profile Switching
+
+```bash
+modsync profile switch vanilla-plus
+modsync profile switch hardcore
+modsync profile switch hardcore --dry-run
+```
+
+`profile switch` строит полный `SwitchPlan` между активным и целевым профилями. До первой физической записи ModSync проверяет оба state, ownership, dependency graph, SHA256, disabled content, unmanaged destinations, path containment, symlink/hardlink и case collisions. Совпадающие destination, owner и SHA256 остаются на месте; файлы только исходного профиля удаляются, а отличающиеся и новые файлы восстанавливаются из profile artifacts либо подготавливаются через сохранённые source metadata до mutation phase.
+
+Switch разрешён только для профилей одной игры с одним canonical game root. Для разных game root используйте логический `profile activate`. Runtime-файл, изменённый вне ModSync, блокирует switch; unmanaged destination никогда не перезаписывается. Сложный persistent archive cache не создаётся, поэтому при отсутствии сохранённого profile artifact может потребоваться сеть — список таких packages виден в dry-run.
+
+### Activate vs Switch
+
+- `modsync profile activate <name>` изменяет только активный контекст ModSync и сохраняет прежнее поведение CLI; физические файлы игры не меняются.
+- `modsync profile switch <name>` приводит общий game root к ownership-state выбранного профиля и делает его активным только после успешной проверки.
+
+### Profile-specific configuration
+
+Изменённые пользовательские файлы `BepInEx/config` при уходе с профиля сохраняются в его `preserved-config/` вместе с относительным путём, SHA256, originating profile и временем обновления. При возвращении конфиги этого профиля восстанавливаются, поэтому настройки разных профилей не смешиваются. Неизменённые configs обрабатываются как обычные managed artifacts.
+
+Disabled packages сохраняют status и остаются в profile-specific `disabled/`; их runtime-файлы не попадают в game root. После switch команда `modsync verify --profile <name>` проверяет выбранное физическое состояние, а `modsync profile status` показывает активный профиль, game root, результат проверки и все профили этой установки.
+
+### Shared Game Root
+
+True switching предназначен именно для нескольких profiles, указывающих один физический game root. Hash-based game-root lock не содержит raw absolute path в имени и не позволяет `switch`, `install`, `update`, `uninstall`, `enable`, `disable` или `restore` из другого профиля одновременно менять эту установку. Marker незавершённой операции не запускает автоматических разрушительных действий: следующий switch сообщает о возможном незавершённом переходе и предлагает verify/restore.
 
 ## Профили
 
@@ -227,10 +258,14 @@ ModSync/
         ├── profile.json       # metadata профиля
         ├── modpack.json       # сохранённая копия modpack
         ├── state.json         # state только этого профиля
+        ├── artifacts/         # managed-файлы для offline switch-back
+        ├── disabled/          # отключённый runtime этого профиля
+        ├── preserved-config/  # пользовательские configs этого профиля
+        ├── preserved-config.json
         └── backups/           # backup только этого профиля
 ```
 
-Изменяющие операции `install`, `update` и `backup restore` защищены блокировкой на профиль. Параллельные команды чтения не блокируются. Команда `profile delete` требует подтверждения; `--yes` его пропускает. Удаляются только служебные данные ModSync; папка игры и установленные моды не удаляются.
+Изменяющие операции защищены блокировкой профиля и общей hash-based блокировкой game root. Параллельные команды чтения не блокируются. Команда `profile delete` требует подтверждения; `--yes` его пропускает. Удаляются только служебные данные ModSync; папка игры и установленные моды не удаляются.
 
 ## Backup & Rollback
 
@@ -259,7 +294,7 @@ modsync backup list modpack.json
 modsync backup restore modpack.json 20260916T153012Z-a4f21c
 ```
 
-Перед восстановлением ModSync проверяет metadata, безопасность всех путей, SHA256, state-файл, символические и жёсткие ссылки. Изменение текущей установки начинается только после полной проверки. Восстанавливаются моды и записи state, относящиеся к выбранному backup; более поздние изменения других модов сохраняются. Если update завершается ошибкой после начала применения файлов, ModSync автоматически пытается восстановить созданный backup и отдельно сообщает результат rollback, не скрывая первоначальную ошибку.
+Перед восстановлением ModSync проверяет metadata, безопасность всех путей, SHA256, state-файл, символические и жёсткие ссылки. Изменение текущей установки начинается только после полной проверки. Восстанавливаются моды и записи state, относящиеся к выбранному backup; более поздние изменения других модов сохраняются. Если update завершается ошибкой после начала применения файлов, ModSync автоматически пытается восстановить созданный backup и отдельно сообщает результат rollback, не скрывая первоначальную ошибку. Profile switch использует совместимую schema v4 того же BackupManager: snapshot включает game files, оба profile state, active profile и изменяемые profile artifacts/configs. Schemas v1-v3 продолжают читаться и восстанавливаться.
 
 ## Формат модпака
 
@@ -421,7 +456,7 @@ python -m pytest
 - [x] Valheim + BepInEx.
 - [x] Uninstall.
 - [x] Enable / Disable.
-- [ ] Настоящее переключение файлов между profiles.
+- [x] True Profile Switching.
 - [ ] Автоматическое обнаружение игры.
 - [ ] GUI.
 
@@ -434,11 +469,12 @@ python -m pytest
 - Отключённые или удалённые из модпака моды не удаляются автоматически.
 - Backup создаётся автоматически для `update`; отдельной команды ручного создания пока нет.
 - Retention фиксирован на пяти последних backup и пока не настраивается.
-- ModSync не переключает автоматически настройки самой игры; active profile выбирает контекст команд ModSync.
-- Adapter-mode в v0.7.0 поддерживает только Valheim + BepInEx; автоматическая установка BepInEx выполняется только если loader является явным package/dependency.
+- `profile activate` намеренно остаётся логическим выбором; физическое состояние меняет только `profile switch`.
+- Adapter-mode в v0.8.0 поддерживает только Valheim + BepInEx; автоматическая установка BepInEx выполняется только если loader является явным package/dependency.
 - Lifecycle-команды требуют ownership state adapter-mode; legacy installation pipeline продолжает работать, но небезопасное угадывание ownership для старых directory-only записей не выполняется.
 - Orphan dependencies только анализируются и не удаляются автоматически; команда `cleanup` зарезервирована для будущей версии.
-- Если несколько профилей указывают одинаковый `install_directory`, ModSync показывает предупреждение. Profiles share the same physical mod directory. Their ModSync state and backups remain separate, but installed files may overlap.
+- Physical switch поддерживается только между профилями одной игры с одинаковым canonical game root; между разными установками используйте `profile activate`.
+- Изменённый managed runtime блокирует switch; `--force` для true switching в v0.8.0 намеренно не добавлен. При отсутствии profile artifact может потребоваться повторная загрузка по сохранённым точным source metadata.
 - Откат использует безопасное best-effort поведение и не заявляет абсолютную транзакционность файловой системы на всех платформах.
 - Автоматическое разрешение зависимостей доступно только для Thunderstore; автоудаление orphan-зависимостей и команда предпросмотра графа пока не реализованы.
 - Публичный Thunderstore API не требует аутентификации; ModSync не реализует загрузку/публикацию пакетов и GUI.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -200,6 +201,8 @@ class ProfileStore:
                 atomic_write_bytes(temporary / "modpack.json", source_bytes)
                 atomic_write_json(temporary / "state.json", empty_state())
                 (temporary / "backups").mkdir()
+                (temporary / "artifacts").mkdir()
+                (temporary / "preserved-config").mkdir()
                 atomic_write_json(temporary / "profile.json", metadata)
                 temporary.replace(self.profiles_directory / name)
             except OSError as exc:
@@ -308,6 +311,26 @@ class ProfileStore:
     def global_lock(self) -> ProfileLock:
         return ProfileLock(self.locks_directory / "global.lock", "profile storage")
 
+    def game_root_lock(self, game_root: Path) -> ProfileLock:
+        """Lock one physical installation across every profile that references it."""
+        identity = self.game_root_identity(game_root)
+        return ProfileLock(
+            self.locks_directory / f"game-{identity}.lock",
+            f"game root {identity[:12]}",
+        )
+
+    @staticmethod
+    def game_root_identity(game_root: Path) -> str:
+        """Return a stable, filename-safe identity for a canonical game root."""
+        canonical = os.path.normpath(str(game_root.expanduser().resolve(strict=False)))
+        if os.name == "nt" or sys.platform == "darwin":
+            canonical = canonical.casefold()
+        canonical = canonical.replace("\\", "/")
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def switch_marker(self, game_root: Path) -> Path:
+        return self.root / "switch-markers" / f"{self.game_root_identity(game_root)}.json"
+
     def _prepare_root(self) -> None:
         if self.root.is_symlink():
             raise ProfileError("Profile data directory must not be a symbolic link")
@@ -372,6 +395,10 @@ class ProfileStore:
         backups = directory / "backups"
         if backups.is_symlink() or not backups.is_dir():
             raise ProfileError(f"Missing or unsafe backups directory for profile {name}")
+        for optional in ("artifacts", "preserved-config"):
+            candidate = directory / optional
+            if candidate.exists() and (candidate.is_symlink() or not candidate.is_dir()):
+                raise ProfileError(f"Unsafe {optional} directory for profile {name}")
         return Profile(
             name=name,
             game=metadata["game"],

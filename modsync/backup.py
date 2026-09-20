@@ -385,6 +385,125 @@ class BackupManager:
             shutil.rmtree(temporary, ignore_errors=True)
             raise BackupError(f"Could not create backup {backup_id}: {exc}") from exc
 
+    def create_switch(
+        self,
+        *,
+        source_profile: str,
+        target_profile: str,
+        active_profile: str,
+        game_root_identity: str,
+        affected_game_paths: Sequence[PurePosixPath],
+        source_artifact_paths: Sequence[PurePosixPath],
+        source_config_paths: Sequence[PurePosixPath],
+        source_state: dict[str, Any],
+        target_state: dict[str, Any],
+        config_snapshot: dict[str, Any],
+    ) -> BackupInfo:
+        """Create a schema-v4 snapshot for a cross-profile physical switch."""
+        try:
+            validate_state(source_state)
+            validate_state(target_state)
+            self._prepare_backup_root()
+            created = datetime.now(UTC)
+            backup_id = self._new_backup_id(created)
+            temporary = Path(tempfile.mkdtemp(prefix=".creating-", dir=self.backup_root))
+        except (OSError, StateError) as exc:
+            raise BackupError(f"Could not prepare switch backup storage: {exc}") from exc
+
+        source_directory = self.state_path.parent
+        if source_directory.name != source_profile or source_directory.is_symlink():
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise BackupError("Switch backup source profile does not match its state path")
+        profiles_directory = source_directory.parent
+        target_directory = profiles_directory / target_profile
+        if target_directory.is_symlink() or not target_directory.is_dir():
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise BackupError("Switch backup target profile is unavailable")
+        roots = {
+            "game": self.root,
+            "source-artifacts": source_directory / "artifacts",
+            "source-config": source_directory / "preserved-config",
+            "source-profile": source_directory,
+        }
+        affected_values: list[tuple[str, PurePosixPath]] = []
+        affected_values.extend(("game", path) for path in affected_game_paths)
+        affected_values.extend(
+            ("source-artifacts", path) for path in source_artifact_paths
+        )
+        affected_values.extend(("source-config", path) for path in source_config_paths)
+        affected_values.append(
+            ("source-profile", PurePosixPath("preserved-config.json"))
+        )
+        try:
+            files_root = temporary / "files"
+            files_root.mkdir()
+            affected_files: list[dict[str, object]] = []
+            saved_files: list[dict[str, str]] = []
+            seen: set[str] = set()
+            for storage, relative_value in affected_values:
+                relative = _safe_relative_path(
+                    relative_value.as_posix(), "switch affected file path"
+                )
+                backup_relative = PurePosixPath(storage, *relative.parts)
+                value = backup_relative.as_posix()
+                if value in seen:
+                    continue
+                seen.add(value)
+                root = roots[storage]
+                source = _safe_storage_target(root, relative, storage)
+                existed = source.exists() or source.is_symlink()
+                if existed:
+                    _ensure_regular_file(source, f"{storage} switch file")
+                    destination = files_root.joinpath(*backup_relative.parts)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination, follow_symlinks=False)
+                    saved_files.append(
+                        {"path": value, "sha256": sha256_file(destination)}
+                    )
+                affected_files.append({"path": value, "existed": existed})
+
+            snapshots = {
+                "source-state.json": source_state,
+                "target-state.json": target_state,
+                "active-config.json": config_snapshot,
+            }
+            snapshot_hashes: dict[str, str] = {}
+            for filename, value in snapshots.items():
+                destination = temporary / filename
+                atomic_write_json(destination, value)
+                snapshot_hashes[filename] = sha256_file(destination)
+            installed_version = source_state.get("modpack", {}).get("version")
+            if not isinstance(installed_version, str) or not installed_version:
+                installed_version = self.modpack.version
+            metadata = {
+                "schema_version": 4,
+                "backup_id": backup_id,
+                "created_at": created.isoformat().replace("+00:00", "Z"),
+                "modpack": {"name": self.modpack.name, "version": installed_version},
+                "target_modpack_version": self.modpack.version,
+                "reason": "profile-switch",
+                "file_count": len(saved_files),
+                "state_sha256": snapshot_hashes["source-state.json"],
+                "source_state_sha256": snapshot_hashes["source-state.json"],
+                "target_state_sha256": snapshot_hashes["target-state.json"],
+                "config_sha256": snapshot_hashes["active-config.json"],
+                "source_profile": source_profile,
+                "target_profile": target_profile,
+                "active_profile": active_profile,
+                "game_root_identity": game_root_identity,
+                "affected_files": affected_files,
+                "saved_files": sorted(saved_files, key=lambda item: item["path"]),
+            }
+            atomic_write_json(temporary / "metadata.json", metadata)
+            temporary.replace(self.backup_root / backup_id)
+            return self._info_from_metadata(metadata)
+        except BackupError:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+        except (OSError, BackupIntegrityError) as exc:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise BackupError(f"Could not create switch backup {backup_id}: {exc}") from exc
+
     def list_backups(self) -> list[BackupInfo]:
         """Return validated backup summaries, newest first."""
         if not self.backup_root.exists():
@@ -411,6 +530,8 @@ class BackupManager:
             return self._restore_paths(backup_id, metadata, state_snapshot)
         if metadata["schema_version"] == 3:
             return self._restore_mutation(backup_id, metadata, state_snapshot)
+        if metadata["schema_version"] == 4:
+            return self._restore_switch(backup_id, metadata)
         backup_directory = self.backup_root / backup_id
         affected = metadata["affected_mods"]
         saved_files = metadata["saved_files"]
@@ -615,6 +736,140 @@ class BackupManager:
                 raise RollbackError(f"Restore of {backup_id} failed: {original}") from original
         return RestoreReport(backup_id, len(metadata["saved_files"]), True)
 
+    def _restore_switch(
+        self, backup_id: str, metadata: dict[str, Any]
+    ) -> RestoreReport:
+        """Restore schema-v4 game, profile storage, states, and active profile."""
+        backup_directory = self.backup_root / backup_id
+        source_directory = self.state_path.parent
+        profiles_directory = source_directory.parent
+        data_directory = profiles_directory.parent
+        if (
+            source_directory.name != metadata["source_profile"]
+            or profiles_directory.name != "profiles"
+            or source_directory.is_symlink()
+        ):
+            raise BackupIntegrityError("Switch backup source profile context is invalid")
+        target_directory = profiles_directory / metadata["target_profile"]
+        if target_directory.is_symlink() or not target_directory.is_dir():
+            raise BackupIntegrityError("Switch backup target profile is unavailable")
+        roots = {
+            "game": self.root,
+            "source-artifacts": source_directory / "artifacts",
+            "source-config": source_directory / "preserved-config",
+            "source-profile": source_directory,
+        }
+        snapshot_paths = {
+            "source-state.json": source_directory / "state.json",
+            "target-state.json": target_directory / "state.json",
+            "active-config.json": data_directory / "config.json",
+        }
+        snapshots: dict[str, bytes] = {}
+        for filename in snapshot_paths:
+            source = backup_directory / filename
+            _ensure_regular_file(source, "switch snapshot")
+            snapshots[filename] = source.read_bytes()
+
+        transaction_parent = self.backup_root.parent
+        transaction_parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=".modsync-switch-restore-", dir=transaction_parent
+        ) as name:
+            transaction = Path(name)
+            staged = transaction / "staged"
+            current = transaction / "current"
+            staged.mkdir()
+            current.mkdir()
+            for saved in metadata["saved_files"]:
+                relative = _safe_relative_path(saved["path"], "saved switch file path")
+                source = backup_directory / "files" / Path(*relative.parts)
+                destination = staged / Path(*relative.parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination, follow_symlinks=False)
+
+            previous_snapshots = {
+                filename: self._read_current_state_bytes(path)
+                for filename, path in snapshot_paths.items()
+            }
+            moved: list[tuple[Path, Path | None]] = []
+            try:
+                for index, affected in enumerate(metadata["affected_files"]):
+                    backup_relative = _safe_relative_path(
+                        affected["path"], "affected switch file path"
+                    )
+                    storage, *relative_parts = backup_relative.parts
+                    relative = PurePosixPath(*relative_parts)
+                    target = _safe_storage_target(roots[storage], relative, storage)
+                    if target.is_symlink():
+                        raise RollbackError(
+                            f"Refusing to restore switch file through a link: {backup_relative}"
+                        )
+                    preserved: Path | None = None
+                    if target.exists():
+                        _ensure_regular_file(
+                            target, "current switch file", reject_hardlinks=False
+                        )
+                        preserved = current / str(index)
+                        target.replace(preserved)
+                    moved.append((target, preserved))
+                    if affected["existed"]:
+                        source = staged.joinpath(*backup_relative.parts)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        source.replace(target)
+
+                for filename, destination in snapshot_paths.items():
+                    atomic_write_bytes(destination, snapshots[filename])
+
+                for saved in metadata["saved_files"]:
+                    backup_relative = _safe_relative_path(
+                        saved["path"], "saved switch file path"
+                    )
+                    storage, *relative_parts = backup_relative.parts
+                    target = _safe_storage_target(
+                        roots[storage], PurePosixPath(*relative_parts), storage
+                    )
+                    if not target.is_file() or sha256_file(target) != saved["sha256"]:
+                        raise RollbackError(
+                            f"Restored switch file failed verification: {backup_relative}"
+                        )
+                for filename, destination in snapshot_paths.items():
+                    expected = metadata[
+                        {
+                            "source-state.json": "source_state_sha256",
+                            "target-state.json": "target_state_sha256",
+                            "active-config.json": "config_sha256",
+                        }[filename]
+                    ]
+                    if sha256_file(destination) != expected:
+                        raise RollbackError(
+                            f"Restored switch snapshot failed verification: {filename}"
+                        )
+                marker_directory = data_directory / "switch-markers"
+                if marker_directory.exists() and (
+                    marker_directory.is_symlink() or not marker_directory.is_dir()
+                ):
+                    raise RollbackError("Switch marker directory is unsafe")
+                marker = marker_directory / f"{metadata['game_root_identity']}.json"
+                marker.unlink(missing_ok=True)
+            except Exception as original:
+                for target, preserved in reversed(moved):
+                    target.unlink(missing_ok=True)
+                    if preserved is not None and preserved.exists():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        preserved.replace(target)
+                for filename, destination in snapshot_paths.items():
+                    previous = previous_snapshots[filename]
+                    if previous is None:
+                        destination.unlink(missing_ok=True)
+                    else:
+                        atomic_write_bytes(destination, previous)
+                if isinstance(original, BackupError):
+                    raise
+                raise RollbackError(
+                    f"Restore of switch backup {backup_id} failed: {original}"
+                ) from original
+        return RestoreReport(backup_id, len(metadata["saved_files"]), True)
+
     def prune(self, retention: int = DEFAULT_RETENTION) -> list[str]:
         """Delete backups older than the retention count after a successful update."""
         if retention < 1:
@@ -673,15 +928,57 @@ class BackupManager:
         if not verify_files:
             return metadata, {}
 
-        state_path = directory / "state.json"
-        _ensure_regular_file(state_path, "backup state")
-        if sha256_file(state_path) != metadata["state_sha256"]:
-            raise BackupIntegrityError(f"State checksum mismatch in backup {backup_id}")
-        try:
-            state_value = json.loads(state_path.read_text(encoding="utf-8"))
-            state_snapshot = validate_state(state_value, f"state in backup {backup_id}")
-        except (OSError, json.JSONDecodeError, StateError) as exc:
-            raise BackupIntegrityError(f"Invalid state in backup {backup_id}: {exc}") from exc
+        if metadata["schema_version"] == 4:
+            snapshots: dict[str, Any] = {}
+            for filename, checksum_key in (
+                ("source-state.json", "source_state_sha256"),
+                ("target-state.json", "target_state_sha256"),
+                ("active-config.json", "config_sha256"),
+            ):
+                snapshot_path = directory / filename
+                _ensure_regular_file(snapshot_path, "switch snapshot")
+                if sha256_file(snapshot_path) != metadata[checksum_key]:
+                    raise BackupIntegrityError(
+                        f"Switch snapshot checksum mismatch in backup {backup_id}: {filename}"
+                    )
+                try:
+                    value = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise BackupIntegrityError(
+                        f"Invalid switch snapshot in backup {backup_id}: {filename}"
+                    ) from exc
+                snapshots[filename] = value
+            try:
+                source_state = validate_state(
+                    snapshots["source-state.json"], f"source state in backup {backup_id}"
+                )
+                validate_state(
+                    snapshots["target-state.json"], f"target state in backup {backup_id}"
+                )
+            except StateError as exc:
+                raise BackupIntegrityError(
+                    f"Invalid switch state in backup {backup_id}: {exc}"
+                ) from exc
+            config = snapshots["active-config.json"]
+            if (
+                not isinstance(config, dict)
+                or config.get("schema_version") != 1
+                or config.get("active_profile") != metadata["active_profile"]
+            ):
+                raise BackupIntegrityError(
+                    f"Invalid active profile snapshot in backup {backup_id}"
+                )
+            state_snapshot = source_state
+        else:
+            state_path = directory / "state.json"
+            _ensure_regular_file(state_path, "backup state")
+            if sha256_file(state_path) != metadata["state_sha256"]:
+                raise BackupIntegrityError(f"State checksum mismatch in backup {backup_id}")
+            try:
+                state_value = json.loads(state_path.read_text(encoding="utf-8"))
+                state_snapshot = validate_state(state_value, f"state in backup {backup_id}")
+            except (OSError, json.JSONDecodeError, StateError) as exc:
+                raise BackupIntegrityError(f"Invalid state in backup {backup_id}: {exc}") from exc
 
         files_root = directory / "files"
         if files_root.is_symlink() or not files_root.is_dir():
@@ -709,13 +1006,16 @@ class BackupManager:
         return metadata, state_snapshot
 
     def _validate_metadata(self, metadata: object, backup_id: str) -> None:
-        if not isinstance(metadata, dict) or metadata.get("schema_version") not in {1, 2, 3}:
+        if not isinstance(metadata, dict) or metadata.get("schema_version") not in {1, 2, 3, 4}:
             raise BackupIntegrityError(f"Unsupported metadata for backup {backup_id}")
         if metadata.get("schema_version") == 2:
             self._validate_path_metadata(metadata, backup_id)
             return
         if metadata.get("schema_version") == 3:
             self._validate_mutation_metadata(metadata, backup_id)
+            return
+        if metadata.get("schema_version") == 4:
+            self._validate_switch_metadata(metadata, backup_id)
             return
         if metadata.get("backup_id") != backup_id:
             raise BackupIntegrityError(f"Backup ID mismatch in metadata: {backup_id}")
@@ -874,6 +1174,109 @@ class BackupManager:
                     raise BackupIntegrityError(
                         f"Invalid lifecycle storage path in backup {backup_id}"
                     )
+
+    def _validate_switch_metadata(
+        self, metadata: dict[str, Any], backup_id: str
+    ) -> None:
+        """Validate schema-v4 metadata before any profile storage is touched."""
+        if metadata.get("backup_id") != backup_id:
+            raise BackupIntegrityError(f"Backup ID mismatch in metadata: {backup_id}")
+        try:
+            created = datetime.fromisoformat(
+                str(metadata.get("created_at")).replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise BackupIntegrityError(
+                f"Invalid creation time in backup {backup_id}"
+            ) from exc
+        if (
+            created.tzinfo is None
+            or created.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ") != backup_id[:16]
+        ):
+            raise BackupIntegrityError(
+                f"Backup creation time does not match its ID: {backup_id}"
+            )
+        modpack = metadata.get("modpack")
+        if (
+            not isinstance(modpack, dict)
+            or modpack.get("name") != self.modpack.name
+            or not isinstance(modpack.get("version"), str)
+            or metadata.get("reason") != "profile-switch"
+        ):
+            raise BackupIntegrityError(f"Invalid switch metadata in backup {backup_id}")
+        profile_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+        windows_reserved = {
+            "CON", "PRN", "AUX", "NUL",
+            *(f"COM{index}" for index in range(1, 10)),
+            *(f"LPT{index}" for index in range(1, 10)),
+        }
+        for key in ("source_profile", "target_profile", "active_profile"):
+            value = metadata.get(key)
+            unsafe = (
+                not isinstance(value, str)
+                or not profile_pattern.fullmatch(value)
+                or value.endswith(".")
+                or value.split(".", 1)[0].upper() in windows_reserved
+            )
+            if unsafe:
+                raise BackupIntegrityError(
+                    f"Invalid {key} in switch backup {backup_id}"
+                )
+        for key in (
+            "state_sha256",
+            "source_state_sha256",
+            "target_state_sha256",
+            "config_sha256",
+        ):
+            if not isinstance(metadata.get(key), str) or not _SHA256_RE.fullmatch(
+                metadata[key]
+            ):
+                raise BackupIntegrityError(
+                    f"Invalid snapshot checksum in switch backup {backup_id}"
+                )
+        identity = metadata.get("game_root_identity")
+        if not isinstance(identity, str) or not _SHA256_RE.fullmatch(identity):
+            raise BackupIntegrityError(
+                f"Invalid game root identity in switch backup {backup_id}"
+            )
+        affected = metadata.get("affected_files")
+        saved = metadata.get("saved_files")
+        if not isinstance(affected, list) or not isinstance(saved, list):
+            raise BackupIntegrityError(f"Invalid switch file lists in backup {backup_id}")
+        allowed = {"game", "source-artifacts", "source-config", "source-profile"}
+        paths: set[str] = set()
+        existed: set[str] = set()
+        for item in affected:
+            if not isinstance(item, dict) or not isinstance(item.get("existed"), bool):
+                raise BackupIntegrityError(f"Invalid affected switch file in {backup_id}")
+            relative = _safe_relative_path(item.get("path"), "affected switch path")
+            value = relative.as_posix()
+            if len(relative.parts) < 2 or relative.parts[0] not in allowed or value in paths:
+                raise BackupIntegrityError(f"Invalid affected switch path in {backup_id}")
+            if relative.parts[0] == "source-profile" and relative.as_posix() != (
+                "source-profile/preserved-config.json"
+            ):
+                raise BackupIntegrityError(f"Invalid source profile path in {backup_id}")
+            paths.add(value)
+            if item["existed"]:
+                existed.add(value)
+        saved_paths: set[str] = set()
+        for item in saved:
+            if not isinstance(item, dict):
+                raise BackupIntegrityError(f"Invalid saved switch file in {backup_id}")
+            relative = _safe_relative_path(item.get("path"), "saved switch path")
+            digest = item.get("sha256")
+            value = relative.as_posix()
+            if (
+                value not in existed
+                or value in saved_paths
+                or not isinstance(digest, str)
+                or not _SHA256_RE.fullmatch(digest)
+            ):
+                raise BackupIntegrityError(f"Invalid saved switch file in {backup_id}")
+            saved_paths.add(value)
+        if saved_paths != existed or metadata.get("file_count") != len(saved):
+            raise BackupIntegrityError(f"Switch backup file manifest mismatch: {backup_id}")
 
     def _info_from_metadata(self, metadata: dict[str, Any]) -> BackupInfo:
         return BackupInfo(

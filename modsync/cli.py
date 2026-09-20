@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Callable, Sequence
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +22,7 @@ from .state import (
     record_install_reason,
     record_status,
 )
+from .switching import ProfileSwitcher
 from .verifier import verify_modpack
 
 
@@ -88,6 +89,14 @@ def build_parser() -> argparse.ArgumentParser:
     profile_info.add_argument("name")
     profile_activate = profile_commands.add_parser("activate", help="Set the active profile")
     profile_activate.add_argument("name")
+    profile_switch = profile_commands.add_parser(
+        "switch", help="Reconcile the physical game root with a profile"
+    )
+    profile_switch.add_argument("name")
+    profile_switch.add_argument(
+        "--dry-run", action="store_true", help="Validate and show the transition"
+    )
+    profile_commands.add_parser("status", help="Show active and physical profile status")
     profile_delete = profile_commands.add_parser("delete", help="Delete ModSync profile data")
     profile_delete.add_argument("name")
     profile_delete.add_argument("--yes", action="store_true", help="Skip confirmation")
@@ -313,7 +322,8 @@ def _warn_shared_install(store: ProfileStore, profile_name: str) -> None:
         return
     print(
         "WARNING: Profiles share the same physical mod directory. "
-        "Their ModSync state and backups remain separate, but installed files may overlap. "
+        "Use 'modsync profile switch NAME' to reconcile physical files safely. "
+        "Profile state and backups remain separate. "
         f"Other profile(s): {', '.join(shared)}",
         file=sys.stderr,
     )
@@ -355,6 +365,45 @@ def _run_profile_command(args: argparse.Namespace, store: ProfileStore) -> int:
     if args.profile_command == "activate":
         profile = store.activate(args.name)
         print(f"Active profile: {profile.name}")
+        print("Physical game files were not changed. Use 'profile switch' to reconcile them.")
+        return 0
+    if args.profile_command == "switch":
+        report = ProfileSwitcher(store).switch(args.name, dry_run=args.dry_run)
+        print(f"Switch: {report.source_profile} -> {report.target_profile}")
+        print(f"Keep: {report.kept} files")
+        print(f"Remove: {report.removed} files")
+        print(f"Install: {report.installed} files")
+        print(f"Restore profile configs: {report.restored_configs} files")
+        print(f"Disable: {len(report.disabled_packages)} packages")
+        print(f"Download required: {len(report.download_packages)} packages")
+        print("No unmanaged conflicts detected.")
+        if report.download_packages:
+            print("Packages: " + ", ".join(report.download_packages))
+        if report.dry_run:
+            print("No active profile, files, state, storage, or backups were changed.")
+        else:
+            print(f"Active profile: {report.target_profile}")
+            if report.backup_id:
+                print(f"Backup created: {report.backup_id}")
+        return 0
+    if args.profile_command == "status":
+        active = store.active_name()
+        if active is None:
+            print("Active profile: none")
+            return 0
+        profile = store.get(active)
+        verification = verify_modpack(store.load_modpack(active))
+        marker = store.switch_marker(profile.install_directory)
+        physical = "verified" if verification.ok else "does not match active profile"
+        if marker.exists() or marker.is_symlink():
+            physical = "previous switch may be incomplete"
+        print(f"Active profile: {active}")
+        print(f"Game root: {profile.install_directory}")
+        print(f"Physical state: {physical}")
+        print("Profiles using this game root:")
+        names = [active, *store.shared_install_profiles(active)]
+        for name in sorted(set(names), key=str.casefold):
+            print(f"- {name}{' *' if name == active else ''}")
         return 0
     if not args.yes:
         answer = input(
@@ -405,12 +454,13 @@ def main(
         ) or (
             args.command == "backup" and args.backup_command == "restore"
         )
-        lock = (
-            store.lock(target.profile_name)
-            if mutating and target.profile_name
-            else nullcontext()
-        )
-        with lock:
+        with ExitStack() as locks:
+            if mutating and target.profile_name:
+                locks.enter_context(store.game_root_lock(target.modpack.install_directory))
+            if mutating and target.profile_name:
+                locks.enter_context(store.lock(target.profile_name))
+            if not mutating:
+                locks.enter_context(nullcontext())
             if args.command == "install":
                 result = _run_install(target.modpack, updating=False, dry_run=dry_run)
             elif args.command == "update":

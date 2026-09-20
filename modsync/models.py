@@ -138,6 +138,54 @@ class EnablePlan:
 
 
 @dataclass(frozen=True, slots=True)
+class SwitchFile:
+    """One ownership-validated file participating in a profile transition."""
+
+    path: PurePosixPath
+    owner: str
+    sha256: str
+    mod_name: str
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
+class SwitchPlan:
+    """Complete, immutable profile reconciliation decision."""
+
+    source_profile: str
+    target_profile: str
+    game_root: Path
+    keep: tuple[SwitchFile, ...]
+    remove: tuple[SwitchFile, ...]
+    install: tuple[SwitchFile, ...]
+    preserve_configs: tuple[SwitchFile, ...]
+    restore_configs: tuple[SwitchFile, ...]
+    disabled_packages: tuple[str, ...]
+    dependencies: tuple[str, ...]
+    unmanaged_conflicts: tuple[PurePosixPath, ...]
+    modified_runtime_files: tuple[PurePosixPath, ...]
+    download_packages: tuple[str, ...]
+    backup_required: bool = True
+
+
+@dataclass(slots=True)
+class SwitchReport:
+    """Summary of a dry-run or completed physical profile switch."""
+
+    source_profile: str
+    target_profile: str
+    dry_run: bool = False
+    changed: bool = False
+    backup_id: str | None = None
+    kept: int = 0
+    removed: int = 0
+    installed: int = 0
+    restored_configs: int = 0
+    disabled_packages: tuple[str, ...] = ()
+    download_packages: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class Profile:
     """Validated metadata for one stored ModSync profile."""
 
