@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from .config import mod_directory_name
+from .exceptions import GameAdapterError
+from .games.base import validate_relative_destination
 from .hashing import sha256_file
 from .models import (
     Mod,
@@ -15,7 +17,7 @@ from .models import (
     VerificationIssue,
     VerificationReport,
 )
-from .state import STATE_FILENAME, load_state_file
+from .state import STATE_FILENAME, disabled_storage_path, load_state_file, record_status
 
 
 def verify_mod_record(
@@ -24,6 +26,7 @@ def verify_mod_record(
     record: object,
     *,
     resolved: ResolvedMod | None = None,
+    disabled_root: Path | None = None,
 ) -> list[str]:
     """Return problems found for one mod and its state record."""
     if not isinstance(record, dict):
@@ -64,9 +67,32 @@ def verify_mod_record(
                 continue
             if expected_owner is not None and owner != expected_owner:
                 problems.append(f"ownership mismatch: {relative}")
-            candidate = root / Path(relative)
             try:
-                candidate.resolve(strict=False).relative_to(root.resolve(strict=False))
+                safe_relative = validate_relative_destination(relative)
+            except GameAdapterError:
+                problems.append(f"contains an unsafe recorded path: {relative}")
+                continue
+            storage = entry.get("storage", "game")
+            if storage not in {"game", "disabled"}:
+                problems.append(f"contains an invalid storage record: {relative}")
+                continue
+            status = record_status(record)
+            if status == "enabled" and storage != "game":
+                problems.append(f"enabled file is outside the game: {relative}")
+                continue
+            if storage == "disabled":
+                if disabled_root is None:
+                    problems.append(f"disabled storage is unavailable: {relative}")
+                    continue
+                candidate = disabled_root / owner / Path(*safe_relative.parts)
+                containment_root = disabled_root
+            else:
+                candidate = root / Path(*safe_relative.parts)
+                containment_root = root
+            try:
+                candidate.resolve(strict=False).relative_to(
+                    containment_root.resolve(strict=False)
+                )
             except ValueError:
                 problems.append(f"contains an unsafe recorded path: {relative}")
                 continue
@@ -117,6 +143,7 @@ def verify_modpack(
     """Verify all enabled mods against local state and recorded file hashes."""
     state_path = modpack.state_path or modpack.install_directory / STATE_FILENAME
     state = load_state_file(state_path)
+    disabled_root = disabled_storage_path(modpack)
     records: dict[str, Any] = state["mods"]
     issues: list[VerificationIssue] = []
     checked = 0
@@ -126,7 +153,11 @@ def verify_modpack(
         checked += 1
         resolved = resolved_by_name.get(mod.name) if resolved_by_name is not None else None
         for message in verify_mod_record(
-            modpack.install_directory, mod, records.get(mod.name), resolved=resolved
+            modpack.install_directory,
+            mod,
+            records.get(mod.name),
+            resolved=resolved,
+            disabled_root=disabled_root,
         ):
             issues.append(VerificationIssue(mod_name=mod.name, message=message))
     explicit_names = {mod.name.casefold() for mod in modpack.mods}
@@ -146,7 +177,10 @@ def verify_modpack(
         )
         checked += 1
         for message in verify_mod_record(
-            modpack.install_directory, dependency, record
+            modpack.install_directory,
+            dependency,
+            record,
+            disabled_root=disabled_root,
         ):
             issues.append(VerificationIssue(mod_name=name, message=message))
     return VerificationReport(checked=checked, issues=tuple(issues))
@@ -158,6 +192,7 @@ def verify_resolved_plan(
     """Verify every explicit and dependency entry in a resolved install plan."""
     state_path = modpack.state_path or modpack.install_directory / STATE_FILENAME
     records: dict[str, Any] = load_state_file(state_path)["mods"]
+    disabled_root = disabled_storage_path(modpack)
     issues: list[VerificationIssue] = []
     for item in plan:
         for message in verify_mod_record(
@@ -165,6 +200,7 @@ def verify_resolved_plan(
             item.mod,
             records.get(item.mod.name),
             resolved=item.resolved,
+            disabled_root=disabled_root,
         ):
             issues.append(VerificationIssue(mod_name=item.mod.name, message=message))
     return VerificationReport(checked=len(plan), issues=tuple(issues))

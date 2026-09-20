@@ -53,6 +53,14 @@ class InstallationConflictError(GameAdapterError):
     """Raised before apply when two owners or an unmanaged file collide."""
 
 
+class LifecycleError(InstallError):
+    """Raised when uninstall, disable, or enable cannot proceed safely."""
+
+
+class DependencySafetyError(LifecycleError):
+    """Raised when a lifecycle operation would break another package."""
+
+
 class ManifestError(InstallError):
     """Raised when package manifest metadata is missing or inconsistent."""
 

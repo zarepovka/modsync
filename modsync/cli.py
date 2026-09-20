@@ -16,7 +16,12 @@ from .exceptions import ModSyncError, ProfileError
 from .installer import Installer
 from .models import Mod, Modpack, Profile
 from .profiles import ProfileStore
-from .state import STATE_FILENAME, load_state_file
+from .state import (
+    STATE_FILENAME,
+    load_state_file,
+    record_install_reason,
+    record_status,
+)
 from .verifier import verify_modpack
 
 
@@ -41,6 +46,25 @@ def build_parser() -> argparse.ArgumentParser:
                 "--dry-run",
                 action="store_true",
                 help="Resolve, download, validate, and print the plan without changing the game",
+            )
+
+    for name, help_text in (
+        ("uninstall", "Safely remove one ownership-tracked mod"),
+        ("disable", "Move a mod out of the game runtime"),
+        ("enable", "Restore a disabled mod to the game runtime"),
+    ):
+        command = subparsers.add_parser(name, help=help_text)
+        command.add_argument("mod_name", help="Installed mod/package name")
+        command.add_argument("modpack", nargs="?", type=Path, help="Path to modpack.json")
+        command.add_argument("--profile", help="Use a stored profile instead of modpack.json")
+        command.add_argument(
+            "--dry-run", action="store_true", help="Validate and show changes without applying"
+        )
+        if name in {"uninstall", "disable"}:
+            command.add_argument(
+                "--force",
+                action="store_true",
+                help="Allow a modified runtime file after backup; security checks still apply",
             )
 
     backup = subparsers.add_parser("backup", help="List or restore installation backups")
@@ -177,7 +201,7 @@ def _run_info(modpack: Modpack) -> int:
         f"Mods: {len(modpack.mods)} configured, "
         f"{len(dependency_records)} dependencies recorded"
     )
-    print("NAME | SOURCE | VERSION | STATUS")
+    print("NAME | SOURCE | VERSION | STATUS | REASON")
     for mod in modpack.mods:
         source_type = mod.source.type if mod.source is not None else "direct"
         record = records.get(mod.name)
@@ -186,13 +210,60 @@ def _run_info(modpack: Modpack) -> int:
         options = mod.source.options if mod.source is not None else {}
         selector = options.get("version") or options.get("release")
         policy = "latest" if selector == "latest" else "pinned"
-        status = policy if mod.enabled else f"disabled/{policy}"
-        print(f"{mod.name} | source: {source_type} | {version} | {status}")
+        status = record_status(record) if isinstance(record, dict) else "not-installed"
+        reason = record_install_reason(record) if isinstance(record, dict) else "explicit"
+        configured = policy if mod.enabled else f"configured-disabled/{policy}"
+        print(
+            f"{mod.name} | source: {source_type} | {version} | "
+            f"{configured}; {status} | {reason}"
+        )
     for name, record in sorted(dependency_records.items(), key=lambda item: item[0].casefold()):
         source = record.get("source")
         source_type = source.get("type") if isinstance(source, dict) else "unknown"
         version = record.get("version") or "unknown"
-        print(f"{name} | source: {source_type} | {version} | dependency")
+        print(
+            f"{name} | source: {source_type} | {version} | "
+            f"dependency; {record_status(record)} | {record_install_reason(record)}"
+        )
+    return 0
+
+
+def _run_lifecycle(
+    modpack: Modpack,
+    *,
+    action: str,
+    mod_name: str,
+    dry_run: bool,
+    force: bool,
+) -> int:
+    installer = Installer()
+    if action == "uninstall":
+        report = installer.uninstall_mod(
+            modpack, mod_name, dry_run=dry_run, force=force
+        )
+    elif action == "disable":
+        report = installer.disable_mod(
+            modpack, mod_name, dry_run=dry_run, force=force
+        )
+    else:
+        report = installer.enable_mod(modpack, mod_name, dry_run=dry_run)
+
+    label = "DRY RUN" if dry_run else action.capitalize()
+    print(f"{label}: {report.mod_name}")
+    for path in report.paths:
+        verb = "would change" if dry_run else "changed"
+        print(f"  {verb}: {path}")
+    for path in report.preserved_files:
+        print(f"Preserved modified configuration: {path}")
+    if report.backup_id is not None:
+        print(f"Backup created: {report.backup_id}")
+    if report.orphan_dependencies:
+        print("The following dependencies may now be unused:")
+        for dependency in report.orphan_dependencies:
+            print(f"- {dependency}")
+        print("Run: modsync cleanup")
+    if dry_run:
+        print("No game files, state, disabled storage, or backups were changed.")
     return 0
 
 
@@ -328,7 +399,10 @@ def main(
             backup_id = None
 
         dry_run = bool(getattr(args, "dry_run", False))
-        mutating = (args.command in {"install", "update"} and not dry_run) or (
+        mutating = (
+            args.command in {"install", "update", "uninstall", "disable", "enable"}
+            and not dry_run
+        ) or (
             args.command == "backup" and args.backup_command == "restore"
         )
         lock = (
@@ -345,6 +419,14 @@ def main(
                 result = _run_verify(target.modpack)
             elif args.command == "info":
                 result = _run_info(target.modpack)
+            elif args.command in {"uninstall", "disable", "enable"}:
+                result = _run_lifecycle(
+                    target.modpack,
+                    action=args.command,
+                    mod_name=args.mod_name,
+                    dry_run=dry_run,
+                    force=bool(getattr(args, "force", False)),
+                )
             elif args.backup_command == "list":
                 result = _run_backup_list(target.modpack)
             else:

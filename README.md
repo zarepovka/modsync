@@ -2,7 +2,7 @@
 
 [![Тесты](https://github.com/zarepovka/modsync/actions/workflows/tests.yml/badge.svg)](https://github.com/zarepovka/modsync/actions/workflows/tests.yml)
 
-> **Статус: v0.6.0 — Game Adapters**
+> **Статус: v0.7.0 — Uninstall & Enable/Disable**
 
 ModSync — небольшой кроссплатформенный менеджер модпаков с интерфейсом командной строки. Передайте друзьям файл `modpack.json`, и ModSync скачает включённые моды, проверит их, безопасно обновит установку и сохранит локальное состояние. Профили позволяют вести несколько наборов модов с независимыми state и backup.
 
@@ -16,6 +16,7 @@ ModSync — небольшой кроссплатформенный менедж
 - Расширяемый реестр игровых адаптеров и первая реализация для Valheim + BepInEx.
 - Полный план установки, file ownership и обнаружение конфликтов до первой записи.
 - Безопасный dry-run без изменения игры, state или backup.
+- Безопасные uninstall и временное enable/disable на основе file ownership.
 - Потоковая загрузка с отображением прогресса без помещения всего файла в память.
 - Проверка необязательной контрольной суммы SHA256 перед установкой.
 - Безопасная распаковка ZIP с защитой от обхода путей и символических ссылок.
@@ -72,6 +73,9 @@ modsync profile list
 modsync profile info friends-server
 modsync install --profile friends-server
 modsync install --profile friends-server --dry-run
+modsync disable ExampleMod --profile friends-server
+modsync enable ExampleMod --profile friends-server
+modsync uninstall ExampleMod --profile friends-server
 modsync verify --profile friends-server
 modsync update --profile friends-server
 modsync info --profile friends-server
@@ -164,6 +168,45 @@ Adapter-state хранит каждый установленный destination �
 ## Installation Conflicts
 
 Весь план проверяется до записи первого игрового файла. Установка останавливается, если два package претендуют на один destination, если collision возникает только из-за регистра на case-insensitive платформе, либо если destination уже занят unmanaged-файлом. Замена разрешена только тому же owner; при update предыдущий файл попадает в backup.
+
+## Uninstall
+
+```bash
+modsync uninstall ExampleMod --profile friends-server
+modsync uninstall ExampleMod modpack.json --dry-run
+```
+
+Uninstall строит полный `RemovalPlan`, проверяет ownership и dependents, создаёт backup и удаляет только managed-файлы выбранного package. Shared-файлы с неоднозначным владельцем, unsafe state paths, symlink/hardlink и изменённые runtime-файлы блокируют операцию. Для намеренного удаления изменённого бинарного файла доступен `--force`, но он не отключает проверки путей, ownership или ссылок.
+
+## Enable / Disable
+
+```bash
+modsync disable ExampleMod
+modsync enable ExampleMod
+```
+
+`disable` временно убирает runtime-файлы мода из BepInEx, сохраняя package и state в ModSync. `uninstall` удаляет управляемые файлы мода из игры и его запись из state.
+
+Runtime-файлы отключённого package хранятся вне каталогов загрузчика:
+
+- profile-mode: `profiles/<profile>/disabled/<package>/...`;
+- adapter-mode без profile: `<game-root>/.modsync-disabled/<package>/...`.
+
+Исходная относительная структура, owner и SHA256 сохраняются. Enable проверяет checksum disabled content, наличие включённых dependencies и отсутствие unmanaged/case-insensitive destination conflicts до восстановления файлов. Нельзя отключить dependency, пока от неё зависит включённый mod.
+
+## Managed Files
+
+State явно хранит `status` (`enabled` или `disabled`), `install_reason` (`explicit` или `dependency`), package owner, dependency names и расположение каждого managed-файла. Для state v0.5/v0.6 безопасные defaults — `enabled` и `explicit`; Thunderstore dependency metadata v0.6 также используется при dependency safety checks.
+
+## Configuration Preservation
+
+Config-файлы в `BepInEx/config` не перемещаются при disable. При uninstall неизменённый managed config может быть удалён, а изменённый пользователем config сохраняется на месте и становится unmanaged. ModSync всегда сообщает `Preserved modified configuration` и не уничтожает пользовательские настройки даже с `--force`.
+
+## Orphan Dependencies
+
+После удаления explicit-мода ModSync анализирует оставшиеся dependency records. Больше не используемые dependencies не удаляются автоматически, а выводятся как потенциальные orphan packages. Автоматический `cleanup` в v0.7.0 намеренно не реализован.
+
+Для всех трёх операций доступен `--dry-run`: он строит и проверяет план, но не меняет game root, disabled storage, state или backups. Реальные операции используют общий BackupManager schema v3 для game и disabled roots; при ошибке тот же rollback engine восстанавливает файлы и state.
 
 ## Профили
 
@@ -376,7 +419,8 @@ python -m pytest
 - [x] Thunderstore и рекурсивные зависимости.
 - [x] Game Adapter architecture.
 - [x] Valheim + BepInEx.
-- [ ] Uninstall.
+- [x] Uninstall.
+- [x] Enable / Disable.
 - [ ] Настоящее переключение файлов между profiles.
 - [ ] Автоматическое обнаружение игры.
 - [ ] GUI.
@@ -391,7 +435,9 @@ python -m pytest
 - Backup создаётся автоматически для `update`; отдельной команды ручного создания пока нет.
 - Retention фиксирован на пяти последних backup и пока не настраивается.
 - ModSync не переключает автоматически настройки самой игры; active profile выбирает контекст команд ModSync.
-- Adapter-mode в v0.6.0 поддерживает только Valheim + BepInEx; автоматическая установка BepInEx выполняется только если loader является явным package/dependency.
+- Adapter-mode в v0.7.0 поддерживает только Valheim + BepInEx; автоматическая установка BepInEx выполняется только если loader является явным package/dependency.
+- Lifecycle-команды требуют ownership state adapter-mode; legacy installation pipeline продолжает работать, но небезопасное угадывание ownership для старых directory-only записей не выполняется.
+- Orphan dependencies только анализируются и не удаляются автоматически; команда `cleanup` зарезервирована для будущей версии.
 - Если несколько профилей указывают одинаковый `install_directory`, ModSync показывает предупреждение. Profiles share the same physical mod directory. Their ModSync state and backups remain separate, but installed files may overlap.
 - Откат использует безопасное best-effort поведение и не заявляет абсолютную транзакционность файловой системы на всех платформах.
 - Автоматическое разрешение зависимостей доступно только для Thunderstore; автоудаление orphan-зависимостей и команда предпросмотра графа пока не реализованы.

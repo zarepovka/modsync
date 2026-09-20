@@ -26,9 +26,16 @@ from .models import (
     ResolvedMod,
     ResolvedPlanItem,
     InstallationPlan,
+    LifecycleReport,
 )
 from .sources import SourceRegistry, build_default_registry
-from .state import STATE_FILENAME, atomic_write_bytes, load_state_file, save_state_file
+from .state import (
+    STATE_FILENAME,
+    atomic_write_bytes,
+    load_state_file,
+    record_status,
+    save_state_file,
+)
 from .verifier import verify_mod_record, verify_resolved_plan
 
 MAX_ZIP_FILES = 20_000
@@ -119,6 +126,34 @@ class Installer:
         session = getattr(self.downloader, "session", None)
         self.source_registry = source_registry or build_default_registry(session=session)
         self.game_registry = game_registry or build_default_game_registry()
+
+    def uninstall_mod(
+        self, modpack: Modpack, mod_name: str, *, dry_run: bool = False, force: bool = False
+    ) -> LifecycleReport:
+        """Safely remove one ownership-tracked adapter package."""
+        from .lifecycle import LifecycleManager
+
+        return LifecycleManager(modpack).uninstall(
+            mod_name, dry_run=dry_run, force=force
+        )
+
+    def disable_mod(
+        self, modpack: Modpack, mod_name: str, *, dry_run: bool = False, force: bool = False
+    ) -> LifecycleReport:
+        """Move one package's runtime files into protected disabled storage."""
+        from .lifecycle import LifecycleManager
+
+        return LifecycleManager(modpack).disable(
+            mod_name, dry_run=dry_run, force=force
+        )
+
+    def enable_mod(
+        self, modpack: Modpack, mod_name: str, *, dry_run: bool = False
+    ) -> LifecycleReport:
+        """Restore one disabled package after dependency and conflict validation."""
+        from .lifecycle import LifecycleManager
+
+        return LifecycleManager(modpack).enable(mod_name, dry_run=dry_run)
 
     def install_modpack(
         self,
@@ -359,6 +394,9 @@ class Installer:
         changed: list[ResolvedPlanItem] = []
         for item in resolved_plan:
             existing = records.get(item.mod.name)
+            if existing is not None and record_status(existing) == "disabled":
+                report.skipped += 1
+                continue
             if existing is not None and not verify_mod_record(
                 modpack.install_directory, item.mod, existing, resolved=item.resolved
             ):
@@ -416,6 +454,14 @@ class Installer:
                     record.pop("directory", None)
                     record["adapter"] = adapter.game_id
                     record["owner"] = owned_entries[0].owner if owned_entries else mod_directory_name(item.mod.name)
+                    record["package"] = record["owner"]
+                    record["status"] = "enabled"
+                    record["install_reason"] = (
+                        "explicit" if item.explicit else "dependency"
+                    )
+                    record["dependencies"] = [
+                        dependency.name for dependency in item.resolved.dependencies
+                    ]
                     record["installed_files"] = [
                         {
                             "path": entry.destination.as_posix(),
@@ -549,6 +595,12 @@ class Installer:
                 prepared.state_record["role"] = (
                     "explicit" if item.explicit else "dependency"
                 )
+                prepared.state_record["install_reason"] = prepared.state_record["role"]
+                prepared.state_record["status"] = "enabled"
+                prepared.state_record["package"] = mod_directory_name(item.mod.name)
+                prepared.state_record["dependencies"] = [
+                    dependency.name for dependency in item.resolved.dependencies
+                ]
                 prepared.state_record["required_by"] = list(item.required_by)
                 prepared_mods.append(prepared)
             except (ModSyncError, OSError) as exc:

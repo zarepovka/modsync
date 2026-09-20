@@ -94,6 +94,50 @@ class InstallationPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class ManagedFileAction:
+    """A validated ownership-based file operation."""
+
+    path: PurePosixPath
+    owner: str
+    sha256: str
+    source_storage: str
+    destination_storage: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RemovalPlan:
+    """Complete file-removal decision produced before uninstall starts."""
+
+    mod_name: str
+    package: str
+    files: tuple[ManagedFileAction, ...]
+    preserved_files: tuple[PurePosixPath, ...]
+    orphan_dependencies: tuple[str, ...]
+    cleanup_directories: tuple[PurePosixPath, ...]
+    backup_required: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DisablePlan:
+    """Runtime files to move from the game into protected disabled storage."""
+
+    mod_name: str
+    package: str
+    files: tuple[ManagedFileAction, ...]
+    required_by: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class EnablePlan:
+    """Disabled runtime files to restore to their original game destinations."""
+
+    mod_name: str
+    package: str
+    files: tuple[ManagedFileAction, ...]
+    dependencies: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class Profile:
     """Validated metadata for one stored ModSync profile."""
 
@@ -130,6 +174,23 @@ class InstallReport:
     resolved: int = 0
     planned_files: int = 0
     plan_entries: tuple[InstallationPlanEntry, ...] = ()
+
+
+@dataclass(slots=True)
+class LifecycleReport:
+    """Result of uninstall, disable, or enable."""
+
+    action: str
+    mod_name: str
+    changed: bool = False
+    dry_run: bool = False
+    backup_id: str | None = None
+    paths: tuple[str, ...] = ()
+    preserved_files: tuple[str, ...] = ()
+    orphan_dependencies: tuple[str, ...] = ()
+    rollback_attempted: bool = False
+    rollback_succeeded: bool | None = None
+    rollback_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

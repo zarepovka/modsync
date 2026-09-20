@@ -11,10 +11,35 @@ from typing import Any
 from .exceptions import StateError
 
 STATE_FILENAME = ".modsync-state.json"
+DISABLED_DIRECTORY = ".modsync-disabled"
 
 
 def empty_state() -> dict[str, Any]:
     return {"schema_version": 1, "modpack": {}, "mods": {}}
+
+
+def disabled_storage_path(modpack: object) -> Path:
+    """Return profile-isolated storage, or a game-local non-runtime fallback."""
+    state_path = getattr(modpack, "state_path", None)
+    if isinstance(state_path, Path):
+        return state_path.parent / "disabled"
+    install_directory = getattr(modpack, "install_directory")
+    return install_directory / DISABLED_DIRECTORY
+
+
+def record_status(record: object) -> str:
+    """Read v0.7 status with a safe v0.6 default."""
+    if isinstance(record, dict) and record.get("status") == "disabled":
+        return "disabled"
+    return "enabled"
+
+
+def record_install_reason(record: object) -> str:
+    """Read v0.7 install reason with legacy role/default compatibility."""
+    if not isinstance(record, dict):
+        return "explicit"
+    reason = record.get("install_reason", record.get("role", "explicit"))
+    return "dependency" if reason == "dependency" else "explicit"
 
 
 def validate_state(value: object, source: str = "installation state") -> dict[str, Any]:
