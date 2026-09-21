@@ -295,6 +295,51 @@ class ProfileStore:
                 raise ProfileError(f"Cannot relocate profile {name}: {exc}") from exc
         return self.get(name)
 
+    def replace_modpack(self, name: str, document: dict[str, Any]) -> Profile:
+        """Validate and atomically replace a profile's stored modpack document."""
+        name = validate_profile_name(name)
+        with self.global_lock(), self.lock(name):
+            profile = self.get(name)
+            modpack_path = profile.directory / "modpack.json"
+            metadata_path = profile.directory / "profile.json"
+            metadata = self._read_json(metadata_path, "profile metadata")
+            try:
+                original_modpack = modpack_path.read_bytes()
+                original_metadata = metadata_path.read_bytes()
+            except OSError as exc:
+                raise ProfileError(f"Cannot prepare stored modpack update: {exc}") from exc
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".validating-modpack-", suffix=".json", dir=profile.directory
+            )
+            os.close(descriptor)
+            temporary = Path(temporary_name)
+            try:
+                atomic_write_json(temporary, document)
+                candidate = load_modpack(
+                    temporary,
+                    install_directory_override=profile.install_directory,
+                )
+                if candidate.game != profile.game:
+                    raise ProfileError("A profile modpack cannot change its game")
+                if candidate.install_directory != profile.install_directory:
+                    raise ProfileError("A profile modpack cannot change its game root")
+                metadata["mod_count"] = len(candidate.mods)
+                metadata["updated_at"] = _utc_now()
+                atomic_write_json(modpack_path, document)
+                atomic_write_json(metadata_path, metadata)
+            except Exception:
+                try:
+                    atomic_write_bytes(modpack_path, original_modpack)
+                    atomic_write_bytes(metadata_path, original_metadata)
+                except OSError as rollback:
+                    raise ProfileError(
+                        f"Stored modpack update failed and rollback also failed: {rollback}"
+                    ) from rollback
+                raise
+            finally:
+                temporary.unlink(missing_ok=True)
+        return self.get(name)
+
     def active_name(self) -> str | None:
         config = self._load_config()
         active = config["active_profile"]

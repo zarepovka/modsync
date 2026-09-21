@@ -41,6 +41,7 @@ from .verifier import verify_mod_record, verify_resolved_plan
 MAX_ZIP_FILES = 20_000
 MAX_ZIP_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
 InstallProgressCallback = Callable[[Mod, int, int | None], None]
+OperationPhaseCallback = Callable[[str, bool], None]
 BackupManagerFactory = Callable[[Modpack], BackupManager]
 
 
@@ -161,11 +162,16 @@ class Installer:
         progress: InstallProgressCallback | None = None,
         *,
         dry_run: bool = False,
+        phase: OperationPhaseCallback | None = None,
     ) -> InstallReport:
         """Install missing, changed, or damaged mods with v0.1-compatible behavior."""
         if modpack.game_adapter_id is not None:
             return self._install_with_adapter(
-                modpack, progress=progress, updating=False, dry_run=dry_run
+                modpack,
+                progress=progress,
+                updating=False,
+                dry_run=dry_run,
+                phase=phase,
             )
         if dry_run:
             raise InstallError("Dry-run is available for adapter-based modpacks")
@@ -177,6 +183,7 @@ class Installer:
         report = InstallReport(
             skipped=sum(1 for mod in modpack.mods if not mod.enabled)
         )
+        self._notify_phase(phase, "Resolving packages…", True)
         plan = self._resolve_plan(modpack, report)
         if plan is None:
             return report
@@ -195,9 +202,11 @@ class Installer:
 
         with tempfile.TemporaryDirectory(prefix=".modsync-install-", dir=root) as name:
             transaction = Path(name)
+            self._notify_phase(phase, "Downloading and verifying packages…", True)
             prepared_mods = self._prepare_plan(transaction, changed, progress, report)
             if prepared_mods is None:
                 return report
+            self._notify_phase(phase, "Installing files…", False)
             try:
                 displaced = transaction / "displaced"
                 for prepared in prepared_mods:
@@ -226,11 +235,16 @@ class Installer:
         progress: InstallProgressCallback | None = None,
         *,
         dry_run: bool = False,
+        phase: OperationPhaseCallback | None = None,
     ) -> InstallReport:
         """Update all changed mods as one backup-protected transaction."""
         if modpack.game_adapter_id is not None:
             return self._install_with_adapter(
-                modpack, progress=progress, updating=True, dry_run=dry_run
+                modpack,
+                progress=progress,
+                updating=True,
+                dry_run=dry_run,
+                phase=phase,
             )
         if dry_run:
             raise InstallError("Dry-run is available for adapter-based modpacks")
@@ -242,6 +256,7 @@ class Installer:
         report = InstallReport(
             skipped=sum(1 for mod in modpack.mods if not mod.enabled)
         )
+        self._notify_phase(phase, "Resolving packages…", True)
         plan = self._resolve_plan(modpack, report)
         if plan is None:
             return report
@@ -261,10 +276,12 @@ class Installer:
 
         with tempfile.TemporaryDirectory(prefix=".modsync-update-", dir=root) as name:
             transaction = Path(name)
+            self._notify_phase(phase, "Downloading and verifying packages…", True)
             prepared_mods = self._prepare_plan(transaction, changed, progress, report)
             if prepared_mods is None:
                 return report
 
+            self._notify_phase(phase, "Creating backup…", False)
             backup_manager = self.backup_manager_factory(modpack)
             try:
                 backup = backup_manager.create(
@@ -279,6 +296,7 @@ class Installer:
 
             current_mod = "update"
             try:
+                self._notify_phase(phase, "Applying update…", False)
                 displaced = transaction / "displaced"
                 for prepared in prepared_mods:
                     current_mod = prepared.mod.name
@@ -373,6 +391,7 @@ class Installer:
         progress: InstallProgressCallback | None,
         updating: bool,
         dry_run: bool,
+        phase: OperationPhaseCallback | None,
     ) -> InstallReport:
         """Run the provider-neutral, adapter-planned installation pipeline."""
         report = InstallReport(skipped=sum(1 for mod in modpack.mods if not mod.enabled))
@@ -383,6 +402,7 @@ class Installer:
             report.failures.append(InstallFailure("game", self._error_message(exc)))
             return report
 
+        self._notify_phase(phase, "Resolving packages…", True)
         resolved_plan = self._resolve_plan(modpack, report)
         if resolved_plan is None:
             return report
@@ -410,6 +430,7 @@ class Installer:
         prefix = ".modsync-plan-" if dry_run else ".modsync-adapter-"
         with tempfile.TemporaryDirectory(prefix=prefix, dir=temporary_parent) as name:
             transaction = Path(name)
+            self._notify_phase(phase, "Downloading and verifying packages…", True)
             prepared = self._prepare_plan(transaction, changed, progress, report)
             if prepared is None:
                 return report
@@ -428,6 +449,11 @@ class Installer:
             if dry_run:
                 return report
 
+            self._notify_phase(
+                phase,
+                "Creating backup…" if updating else "Installing files…",
+                False,
+            )
             backup_manager = self.backup_manager_factory(modpack)
             if updating:
                 try:
@@ -444,6 +470,7 @@ class Installer:
             applied: list[tuple[Path, Path | None]] = []
             previous_state = state_path.read_bytes() if state_path.exists() else None
             try:
+                self._notify_phase(phase, "Applying files…", False)
                 applied = self._apply_adapter_plan(plan, transaction / "rollback")
                 entries_by_mod: dict[str, list[Any]] = {}
                 for entry in plan.entries:
@@ -512,6 +539,15 @@ class Installer:
                 except BackupError as exc:
                     report.warnings.append(f"Could not apply backup retention: {exc}")
             return report
+
+    @staticmethod
+    def _notify_phase(
+        callback: OperationPhaseCallback | None,
+        message: str,
+        cancellable: bool,
+    ) -> None:
+        if callback is not None:
+            callback(message, cancellable)
 
     @staticmethod
     def _managed_owners(records: dict[str, Any]) -> dict[str, str]:

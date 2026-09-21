@@ -1,10 +1,34 @@
 # ModSync
 
 [![Тесты](https://github.com/zarepovka/modsync/actions/workflows/tests.yml/badge.svg)](https://github.com/zarepovka/modsync/actions/workflows/tests.yml)
+[![Desktop Builds](https://github.com/zarepovka/modsync/actions/workflows/build-gui.yml/badge.svg)](https://github.com/zarepovka/modsync/actions/workflows/build-gui.yml)
 
-> **Статус: v0.9.0 — Automatic Game Discovery**
+> **Статус: v1.0.0 — stable desktop release**
 
-ModSync — небольшой кроссплатформенный менеджер модпаков с интерфейсом командной строки. Передайте друзьям файл `modpack.json`, и ModSync скачает включённые моды, проверит их, безопасно обновит установку и сохранит локальное состояние. Профили позволяют вести несколько наборов модов с независимыми state и backup.
+Cross-platform mod manager with profiles, safe updates and rollback.
+
+ModSync — настоящее desktop-приложение для Valheim с автопоиском Steam-установки, профилями, безопасными обновлениями и откатом. Для автоматизации и опытных пользователей сохранён полноценный CLI. Оба интерфейса используют один и тот же проверенный core.
+
+## Download
+
+Готовые portable-сборки для Windows, macOS и Linux доступны на странице [GitHub Releases](https://github.com/zarepovka/modsync/releases/latest). Распакуйте архив и запустите `ModSync.exe`, `ModSync.app` или `ModSync` соответственно.
+
+Бинарные файлы v1.0.0 не подписаны платными сертификатами Apple/Microsoft, поэтому Gatekeeper или SmartScreen могут показать стандартное предупреждение. ModSync не требует отключать системные механизмы защиты.
+
+## Desktop App
+
+Qt Widgets-интерфейс ведёт через первый запуск, показывает игру, профили, моды и резервные копии. Загрузка, installation/update, переключение профиля и restore выполняются в фоне с безопасной отменой до начала mutation-фазы.
+
+Запуск из Python-окружения:
+
+```bash
+python -m pip install ".[gui]"
+modsync-gui
+```
+
+### Screenshots
+
+Раздел зарезервирован для реальных снимков выпущенного приложения; скриншоты-макеты в репозиторий не добавляются.
 
 ## Возможности
 
@@ -58,15 +82,17 @@ source .venv/bin/activate
 .venv\Scripts\Activate.ps1
 ```
 
-Установите ModSync:
+Установите ModSync с desktop GUI:
 
 ```bash
-python -m pip install .
+python -m pip install ".[gui]"
 ```
 
-Для разработки и запуска тестов используйте `python -m pip install ".[dev]"`. После изменения исходного кода переустановите пакет перед проверкой сгенерированной команды `modsync`.
+Для только CLI достаточно `python -m pip install .`. Для разработки, тестов и desktop-сборки используйте `python -m pip install ".[gui,dev,build]"`.
 
-## Использование
+## Command Line Interface
+
+CLI остаётся полноценным поддерживаемым интерфейсом:
 
 ```bash
 modsync profile create friends-server modpack.json

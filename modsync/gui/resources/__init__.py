@@ -1,0 +1,1 @@
+"""Packaged ModSync desktop resources."""

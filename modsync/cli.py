@@ -18,6 +18,7 @@ from .exceptions import DiscoveryError, DiscoverySelectionError, ModSyncError, P
 from .installer import Installer
 from .models import GameInstallation, Mod, Modpack, Profile
 from .profiles import ProfileStore
+from .services import ModSyncService
 from .state import (
     STATE_FILENAME,
     load_state_file,
@@ -457,7 +458,10 @@ def _select_installation(
 
 
 def _run_profile_command(
-    args: argparse.Namespace, store: ProfileStore, discovery: DiscoveryRegistry
+    args: argparse.Namespace,
+    store: ProfileStore,
+    discovery: DiscoveryRegistry,
+    service: ModSyncService,
 ) -> int:
     if args.profile_command == "list":
         profiles = store.list()
@@ -474,7 +478,6 @@ def _run_profile_command(
         if args.installation is not None and not args.discover:
             raise ProfileError("--installation requires --discover")
         installation = None
-        install_directory = None
         if args.discover:
             probe = load_modpack(
                 args.modpack, install_directory_override=Path.cwd().resolve()
@@ -485,12 +488,15 @@ def _run_profile_command(
             else:
                 candidates = _discover_installations(discovery, probe.game)
                 installation = _select_installation(candidates, args.installation)
-                install_directory = installation.install_path
-        profile = store.create(
+        profile = service.create_profile(
             args.name,
             args.modpack,
-            install_directory=install_directory,
-            installation=_provenance(installation) if installation is not None else None,
+            installation=installation,
+            manual_path=(
+                probe.install_directory
+                if args.discover and installation is None
+                else None
+            ),
         )
         print(f"Profile created: {profile.name}")
         _warn_shared_install(store, profile.name)
@@ -591,11 +597,20 @@ def main(
     args = parser.parse_args(argv)
     store = profile_store or ProfileStore()
     discovery = discovery_registry or build_default_discovery_registry()
+    service = ModSyncService(
+        profile_store=store,
+        discovery_registry=discovery,
+        game_registry=discovery.games,
+    )
     try:
         if args.command == "profile":
-            return _run_profile_command(args, store, discovery)
+            return _run_profile_command(args, store, discovery, service)
         if args.command == "game":
-            installations = discovery.discover(args.game, provider=args.provider)
+            installations = (
+                service.discover_games(args.game)
+                if args.provider.casefold() == "steam"
+                else discovery.discover(args.game, provider=args.provider)
+            )
             if not installations:
                 selected_provider = discovery.get(args.provider)
                 if args.provider.casefold() == "steam" and not getattr(

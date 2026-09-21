@@ -10,6 +10,8 @@ __pycache__/
 htmlcov/
 build/
 dist/
+artifacts/
+*.spec
 *.egg-info/
 
 # Editors and operating systems
