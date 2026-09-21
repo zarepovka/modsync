@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QApplication
 from .. import __version__
 from ..profiles import ProfileStore
 from ..services import ModSyncService
-from .logging_setup import configure_logging
+from .logging_setup import close_logging, configure_logging
 from .main_window import MainWindow
 
 
@@ -44,8 +44,11 @@ def main() -> int:
         window = MainWindow(service, settings=settings, show_onboarding=False)
         window.show()
         QTimer.singleShot(150, app.quit)
-        result = app.exec()
-        temporary.cleanup()
+        try:
+            result = app.exec()
+        finally:
+            close_logging()
+            temporary.cleanup()
         return result
     configure_logging()
     app = create_application()

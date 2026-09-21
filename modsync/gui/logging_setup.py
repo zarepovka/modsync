@@ -47,3 +47,12 @@ def configure_logging(directory: Path | None = None) -> Path:
         )
         logger.addHandler(handler)
     return destination
+
+
+def close_logging() -> None:
+    """Close GUI file handlers so Windows can release the log directory."""
+    logger = logging.getLogger("modsync")
+    for handler in tuple(logger.handlers):
+        if isinstance(handler, RotatingFileHandler):
+            logger.removeHandler(handler)
+            handler.close()
